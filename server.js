@@ -6,19 +6,23 @@ import pkg from "pg";
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
-import { OAuth2Client } from "google-auth-library"; // ← EKLENDİ
+import dotenv from "dotenv";
+import { OAuth2Client } from "google-auth-library";
 
+dotenv.config();
 const { Pool } = pkg;
 
 const {
   DATABASE_URL,
-  JWT_SECRET = "change-me",
-  ALLOWED_ORIGIN = "*",
-  PORT = 8080,
   DATABASE_SSL,
-  // ← EKLENDİ: Google Web Client bilgileri
-  GOOGLE_WEB_CLIENT_ID,
-  GOOGLE_WEB_CLIENT_SECRET,
+  PORT = 8080,
+  ALLOWED_ORIGIN = "*",
+  JWT_SECRET = "change-me",
+
+  // Google OAuth (ID/Secret zorunlu; redirect boş ise 'postmessage' kullanılacak)
+  GOOGLE_CLIENT_ID = "",
+  GOOGLE_CLIENT_SECRET = "",
+  GOOGLE_REDIRECT_URI = "", // boş olabilir → 'postmessage' fallback
 } = process.env;
 
 const pool = new Pool({
@@ -28,9 +32,9 @@ const pool = new Pool({
 
 const app = express();
 app.use(cors({ origin: ALLOWED_ORIGIN }));
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-// ------------------- MIGRATIONS -------------------
+/* ------------------- MIGRATIONS ------------------- */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const MIGRATIONS_DIR = path.join(__dirname, "migrations");
@@ -38,7 +42,7 @@ const MIGRATIONS_DIR = path.join(__dirname, "migrations");
 async function runMigrations() {
   try {
     let files = await fs.readdir(MIGRATIONS_DIR);
-    files = files.filter((f) => f.toLowerCase().endsWith(".sql")).sort();
+    files = files.filter(f => f.toLowerCase().endsWith(".sql")).sort();
     for (const f of files) {
       const sql = await fs.readFile(path.join(MIGRATIONS_DIR, f), "utf8");
       console.log(`[migrate] running: ${f}`);
@@ -51,7 +55,20 @@ async function runMigrations() {
   }
 }
 
-// ------------------- HELPERS -------------------
+/* ------------------- HELPERS ------------------- */
+function makePlayerIdFromSub(sub) {
+  // Google 'sub' → stabil integer (32-bit) üret
+  let h = 2166136261 >>> 0;
+  const s = String(sub);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  // 1..2_147_483_647 aralığına
+  const int31 = (h & 0x7fffffff) || 1;
+  return int31;
+}
+
 function getPlayerFromReq(req) {
   const hdr = req.headers.authorization || "";
   const m = hdr.match(/^Bearer\s+(.+)$/i);
@@ -73,93 +90,70 @@ function requireAuth(req, res, next) {
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// ------------------- AUTH -------------------
-// Google server-side exchange için OAuth client (redirect 'postmessage')
-const oauthClient =
-  GOOGLE_WEB_CLIENT_ID && GOOGLE_WEB_CLIENT_SECRET
-    ? new OAuth2Client(GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, "")
-    : null;
+/* ------------------- AUTH: /auth/google ------------------- */
+const oauthClient = new OAuth2Client({
+  clientId:     GOOGLE_CLIENT_ID || undefined,
+  clientSecret: GOOGLE_CLIENT_SECRET || undefined,
+  redirectUri:  GOOGLE_REDIRECT_URI?.trim() || "postmessage",
+});
 
-/**
- * POST /auth/google
- * Body: { authCode }
- * - authCode -> tokens
- * - id_token doğrulanır, Google 'sub' (google_id) alınır
- * - players upsert
- * - profiles satırı garanti
- * - JWT üret: { playerId } (requireAuth ile uyumlu)
- */
 app.post("/auth/google", async (req, res) => {
   try {
-    const { authCode } = req.body || {};
-    if (!authCode) return res.status(400).json({ error: "authCode_required" });
-
-    if (!oauthClient) {
-      console.warn("[auth] GOOGLE_WEB_CLIENT_ID/SECRET missing");
+    if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+      // Senin loglarda gördüğün "server_not_configured" buydu
+      console.error("auth/google: missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET");
       return res.status(500).json({ error: "server_not_configured" });
     }
 
-    // 1) authCode -> tokens
-    const { tokens } = await oauthClient.getToken(authCode);
+    const code = req.body?.authCode;
+    if (!code || typeof code !== "string") {
+      return res.status(400).json({ error: "invalid_auth_code" });
+    }
 
-    // 2) id_token doğrula
-    if (!tokens.id_token) {
+    // redirectUri boş ise otomatik 'postmessage'
+    const redirectUri = GOOGLE_REDIRECT_URI?.trim() || "postmessage";
+
+    // Kodu token’a çevir
+    const { tokens } = await oauthClient.getToken({
+      code,
+      redirect_uri: redirectUri,
+    });
+
+    const idToken = tokens.id_token;
+    if (!idToken) {
+      console.error("auth/google: no id_token on token response", tokens);
       return res.status(400).json({ error: "no_id_token" });
     }
+
+    // id_token doğrula
     const ticket = await oauthClient.verifyIdToken({
-      idToken: tokens.id_token,
-      audience: GOOGLE_WEB_CLIENT_ID,
+      idToken,
+      audience: GOOGLE_CLIENT_ID,
     });
-    const payload = ticket.getPayload() || {};
-    const sub = payload.sub; // Google unique id
-    const name = payload.name || null;
-    const picture = payload.picture || null;
-    const email = payload.email || null;
+    const payload = ticket.getPayload();
+    const sub = payload?.sub;
+    if (!sub) {
+      return res.status(400).json({ error: "invalid_id_token" });
+    }
 
-    if (!sub) return res.status(400).json({ error: "invalid_id_token" });
+    const playerId = makePlayerIdFromSub(sub);
 
-    // 3) players upsert
-    const upsertSql = `
-      INSERT INTO players (google_id, display_name, photo_url)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (google_id) DO UPDATE
-        SET display_name = COALESCE(EXCLUDED.display_name, players.display_name),
-            photo_url    = COALESCE(EXCLUDED.photo_url, players.photo_url)
-      RETURNING id, google_id, display_name, photo_url
-    `;
-    const { rows } = await pool.query(upsertSql, [sub, name, picture]);
-    const player = rows[0];
-
-    // 4) profiles satırı garanti
-    await pool.query(
-      `INSERT INTO profiles (player_id, data, updated_at)
-       VALUES ($1, '{}'::jsonb, now())
-       ON CONFLICT (player_id) DO NOTHING`,
-      [player.id]
-    );
-
-    // 5) JWT üret — payload { playerId }
-    const token = jwt.sign({ playerId: player.id }, JWT_SECRET, { expiresIn: "30d" });
+    // Uygulamanın kullanacağı kendi JWT’si
+    const appJwt = jwt.sign({ playerId }, JWT_SECRET, { expiresIn: "30d" });
 
     return res.json({
-      token,
-      player: {
-        id: player.id,
-        google_id: player.google_id,
-        name: player.display_name,
-        photo_url: player.photo_url,
-        email,
-      },
+      token: appJwt,
+      player: { playerId, googleSub: sub },
     });
   } catch (err) {
-    // Google tarafı hata verirse çoğu zaman 400 invalid_grant vb.
-    console.error("auth_google_failed:", err?.response?.data || err);
-    const status = err?.response?.status || 400;
-    return res.status(status).json({ error: "auth_exchange_failed" });
+    console.error("auth/google failed:", err?.response?.data || err?.message || err);
+    // Google 400 dönerse aynen geçir, aksi 500
+    const status = err?.response?.status || 500;
+    return res.status(status).json({ error: "auth_failed" });
   }
 });
 
-// ------------------- SYNC -------------------
+/* ------------------- SYNC ------------------- */
 // GET snapshot
 app.get("/sync/snapshot", requireAuth, async (req, res) => {
   try {
@@ -223,7 +217,7 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
   }
 });
 
-// ------------------- START -------------------
+/* ------------------- START ------------------- */
 await runMigrations();
 
 app.listen(PORT, () => {
