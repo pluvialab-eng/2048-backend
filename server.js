@@ -100,7 +100,6 @@ const oauthClient = new OAuth2Client({
 app.post("/auth/google", async (req, res) => {
   try {
     if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
-      // Senin loglarda gördüğün "server_not_configured" buydu
       console.error("auth/google: missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET");
       return res.status(500).json({ error: "server_not_configured" });
     }
@@ -110,7 +109,6 @@ app.post("/auth/google", async (req, res) => {
       return res.status(400).json({ error: "invalid_auth_code" });
     }
 
-    // redirectUri boş ise otomatik 'postmessage'
     const redirectUri = GOOGLE_REDIRECT_URI?.trim() || "";
 
     // Kodu token’a çevir
@@ -147,7 +145,6 @@ app.post("/auth/google", async (req, res) => {
     });
   } catch (err) {
     console.error("auth/google failed:", err?.response?.data || err?.message || err);
-    // Google 400 dönerse aynen geçir, aksi 500
     const status = err?.response?.status || 500;
     return res.status(status).json({ error: "auth_failed" });
   }
@@ -182,13 +179,28 @@ app.get("/sync/snapshot", requireAuth, async (req, res) => {
 
     return res.json(rows[0]);
   } catch (err) {
-  console.error("snapshot_failed:", {
-    code: err.code, detail: err.detail, message: err.message,
-    table: err.table, constraint: err.constraint,
-  });
-  return res.status(500).json({ error: "snapshot_failed" });
+    console.error("snapshot_failed:", {
+      code: err.code, detail: err.detail, message: err.message,
+      table: err.table, constraint: err.constraint,
+    });
+    return res.status(500).json({ error: "snapshot_failed" });
   }
 });
+
+// Yardımcı: payload anlamlı mı?
+function hasMeaningfulData(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return false;
+  for (const k of keys) {
+    const v = obj[k];
+    if (v === null || v === undefined) continue;
+    if (typeof v === "number" && v !== 0) return true;
+    if (typeof v === "string" && v.trim() !== "") return true;
+    if (typeof v === "object" && Object.keys(v).length > 0) return true;
+  }
+  return false;
+}
 
 // POST merge
 app.post("/sync/merge", requireAuth, async (req, res) => {
@@ -197,8 +209,21 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
     const body = req.body || {};
     const data = body.data;
 
-    if (!data || typeof data !== "object") {
-      return res.status(400).json({ error: "no_data" });
+    // Boş/anlamsız merge => hiçbir şeyi ezme, mevcut kaydı döndür
+    if (!hasMeaningfulData(data)) {
+      const q0 = `SELECT data, updated_at FROM profiles WHERE player_id = $1::int`;
+      const r0 = await pool.query(q0, [playerId]);
+      if (r0.rows.length > 0) return res.json(r0.rows[0]);
+
+      // kayıt yoksa oluştur ve boş döndür
+      const ins = `
+        INSERT INTO profiles (player_id, data, updated_at)
+        VALUES ($1::int, '{}'::jsonb, now())
+        ON CONFLICT (player_id) DO NOTHING
+        RETURNING data, updated_at
+      `;
+      const r1 = await pool.query(ins, [playerId]);
+      return res.json(r1.rows[0] ?? { data: {}, updated_at: new Date().toISOString() });
     }
 
     const q = `
@@ -206,7 +231,10 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
       VALUES ($1::int, $2::jsonb, now())
       ON CONFLICT (player_id) DO UPDATE
       SET
-        data = COALESCE(profiles.data, '{}'::jsonb) || EXCLUDED.data,
+        data = CASE
+                 WHEN EXCLUDED.data = '{}'::jsonb THEN profiles.data
+                 ELSE COALESCE(profiles.data, '{}'::jsonb) || EXCLUDED.data
+               END,
         updated_at = now()
       RETURNING data, updated_at
     `;
@@ -215,7 +243,10 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
 
     return res.json(rows[0]);
   } catch (err) {
-    console.error("merge_failed:", err);
+    console.error("merge_failed:", {
+      code: err.code, detail: err.detail, message: err.message,
+      table: err.table, constraint: err.constraint,
+    });
     return res.status(500).json({ error: "merge_failed" });
   }
 });
