@@ -36,7 +36,7 @@ app.post("/auth/google", async (req, res) => {
     params.set("code", authCode);
     params.set("client_id", GOOGLE_CLIENT_ID);
     params.set("client_secret", GOOGLE_CLIENT_SECRET);
-    params.set("redirect_uri", "postmessage"); // kritik
+    params.set("redirect_uri", ""); // kritik
     params.set("grant_type", "authorization_code");
 
     const googleRes = await fetch("https://oauth2.googleapis.com/token", {
