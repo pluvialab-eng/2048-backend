@@ -77,7 +77,7 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 // Google server-side exchange için OAuth client (redirect 'postmessage')
 const oauthClient =
   GOOGLE_WEB_CLIENT_ID && GOOGLE_WEB_CLIENT_SECRET
-    ? new OAuth2Client(GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, "postmessage")
+    ? new OAuth2Client(GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, "")
     : null;
 
 /**
