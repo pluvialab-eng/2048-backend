@@ -39,6 +39,7 @@ async function runMigrations() {
       const sql = await fs.readFile(path.join(MIGRATIONS_DIR, f), "utf8");
       console.log(`[migrate] running: ${f}`);
       await pool.query(sql);
+      console.log(`[migrate] done: ${f}`);
     }
     console.log("[migrate] all migrations complete.");
   } catch (e) {
@@ -54,21 +55,21 @@ function getPlayerFromReq(req) {
   const token = m[1];
   const payload = jwt.verify(token, JWT_SECRET);
   if (!payload?.playerId) throw new Error("Invalid token payload");
-  return payload; // { playerId: <UUID> }
+  return payload; // { playerId: <INTEGER> }  <-- ÖNEMLİ
 }
 
 function requireAuth(req, res, next) {
   try {
     req.player = getPlayerFromReq(req);
     next();
-  } catch (err) {
+  } catch {
     return res.status(401).json({ error: "unauthorized" });
   }
 }
 
-// ------------------- ENDPOINTS -------------------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+// ------------------- SYNC -------------------
 // GET snapshot
 app.get("/sync/snapshot", requireAuth, async (req, res) => {
   try {
@@ -77,14 +78,14 @@ app.get("/sync/snapshot", requireAuth, async (req, res) => {
     const q = `
       SELECT data, updated_at
       FROM profiles
-      WHERE player_id = $1::uuid
+      WHERE player_id = $1::int
     `;
     const { rows } = await pool.query(q, [playerId]);
 
     if (rows.length === 0) {
       const ins = `
         INSERT INTO profiles (player_id, data, updated_at)
-        VALUES ($1::uuid, '{}'::jsonb, now())
+        VALUES ($1::int, '{}'::jsonb, now())
         ON CONFLICT (player_id) DO NOTHING
         RETURNING data, updated_at
       `;
@@ -115,7 +116,7 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
 
     const q = `
       INSERT INTO profiles (player_id, data, updated_at)
-      VALUES ($1::uuid, $2::jsonb, now())
+      VALUES ($1::int, $2::jsonb, now())
       ON CONFLICT (player_id) DO UPDATE
       SET
         data = COALESCE(profiles.data, '{}'::jsonb) || EXCLUDED.data,
