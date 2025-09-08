@@ -182,8 +182,11 @@ app.get("/sync/snapshot", requireAuth, async (req, res) => {
 
     return res.json(rows[0]);
   } catch (err) {
-    console.error("snapshot_failed:", err);
-    return res.status(500).json({ error: "snapshot_failed" });
+  console.error("snapshot_failed:", {
+    code: err.code, detail: err.detail, message: err.message,
+    table: err.table, constraint: err.constraint,
+  });
+  return res.status(500).json({ error: "snapshot_failed" });
   }
 });
 
