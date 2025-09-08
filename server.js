@@ -94,7 +94,7 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 const oauthClient = new OAuth2Client({
   clientId:     GOOGLE_CLIENT_ID || undefined,
   clientSecret: GOOGLE_CLIENT_SECRET || undefined,
-  redirectUri:  GOOGLE_REDIRECT_URI?.trim() || "postmessage",
+  redirectUri:  GOOGLE_REDIRECT_URI?.trim() || "",
 });
 
 app.post("/auth/google", async (req, res) => {
@@ -111,7 +111,7 @@ app.post("/auth/google", async (req, res) => {
     }
 
     // redirectUri boş ise otomatik 'postmessage'
-    const redirectUri = GOOGLE_REDIRECT_URI?.trim() || "postmessage";
+    const redirectUri = GOOGLE_REDIRECT_URI?.trim() || "";
 
     // Kodu token’a çevir
     const { tokens } = await oauthClient.getToken({
