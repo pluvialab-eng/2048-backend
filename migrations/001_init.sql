@@ -12,7 +12,13 @@ create table if not exists players (
 );
 
 -- ilerleme: mod başına tek satır (upsert)
-create type if not exists game_mode as enum ('classic4','size5','size6','time60');
+do $$
+begin
+    if not exists (select 1 from pg_type where typname = 'game_mode') then
+        create type game_mode as enum ('classic4','size5','size6','time60');
+    end if;
+end$$;
+
 
 create table if not exists progress (
   player_id bigint not null references players(id) on delete cascade,
