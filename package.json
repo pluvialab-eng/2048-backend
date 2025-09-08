@@ -4,12 +4,14 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "migrate": "node migrate.js"
   },
   "dependencies": {
     "express": "^4.19.2",
     "pg": "^8.11.5",
     "cors": "^2.8.5",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "dotenv": "^16.4.5"
   }
 }
