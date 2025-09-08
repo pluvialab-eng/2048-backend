@@ -3,7 +3,10 @@ import express from "express";
 import cors from "cors";
 import jwt from "jsonwebtoken";
 import pkg from "pg";
-// Node 18+ ise fetch yerleşik; "node-fetch" gereksiz.
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
+
 const { Pool } = pkg;
 
 const {
@@ -11,33 +14,47 @@ const {
   JWT_SECRET = "change-me",
   ALLOWED_ORIGIN = "*",
   PORT = 8080,
-
-  // Sadece /auth/google için; şimdilik akışı bozmayalım:
-  GOOGLE_CLIENT_ID,
-  GOOGLE_CLIENT_SECRET,
+  DATABASE_SSL,
 } = process.env;
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : false,
+  ssl: DATABASE_SSL === "true" ? { rejectUnauthorized: false } : false,
 });
 
 const app = express();
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json());
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// ------------------- MIGRATIONS -------------------
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const MIGRATIONS_DIR = path.join(__dirname, "migrations");
 
-// --- JWT helper ---
+async function runMigrations() {
+  try {
+    let files = await fs.readdir(MIGRATIONS_DIR);
+    files = files.filter(f => f.toLowerCase().endsWith(".sql")).sort();
+    for (const f of files) {
+      const sql = await fs.readFile(path.join(MIGRATIONS_DIR, f), "utf8");
+      console.log(`[migrate] running: ${f}`);
+      await pool.query(sql);
+    }
+    console.log("[migrate] all migrations complete.");
+  } catch (e) {
+    console.error("[migrate] failed:", e);
+  }
+}
+
+// ------------------- HELPERS -------------------
 function getPlayerFromReq(req) {
   const hdr = req.headers.authorization || "";
   const m = hdr.match(/^Bearer\s+(.+)$/i);
   if (!m) throw new Error("No token");
   const token = m[1];
   const payload = jwt.verify(token, JWT_SECRET);
-  // Bizim token'ımız { playerId: ... } şeklinde imzalanıyordu:
   if (!payload?.playerId) throw new Error("Invalid token payload");
-  return payload;
+  return payload; // { playerId: <UUID> }
 }
 
 function requireAuth(req, res, next) {
@@ -45,18 +62,14 @@ function requireAuth(req, res, next) {
     req.player = getPlayerFromReq(req);
     next();
   } catch (err) {
-    const msg = String(err?.message || err);
-    return res.status(401).json({ error: /token/i.test(msg) ? "Invalid token" : "No token" });
+    return res.status(401).json({ error: "unauthorized" });
   }
 }
 
-/** ------------------------------------------------------------------------
- *  SYNC ENDPOINTS  (profiles tablosu: player_id, data jsonb, updated_at)
- *  - İlk snapshot'ta kayıt yoksa boş obje döner.
- *  - Merge: UPSERT + JSONB merge (old || new).
- *  --------------------------------------------------------------------- */
+// ------------------- ENDPOINTS -------------------
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// GET /sync/snapshot  -> mevcut veriyi getir
+// GET snapshot
 app.get("/sync/snapshot", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -64,23 +77,20 @@ app.get("/sync/snapshot", requireAuth, async (req, res) => {
     const q = `
       SELECT data, updated_at
       FROM profiles
-      WHERE player_id = $1
+      WHERE player_id = $1::uuid
     `;
     const { rows } = await pool.query(q, [playerId]);
 
     if (rows.length === 0) {
-      // İlk giriş: boş profil oluştur ve döndür
       const ins = `
         INSERT INTO profiles (player_id, data, updated_at)
-        VALUES ($1, '{}'::jsonb, now())
+        VALUES ($1::uuid, '{}'::jsonb, now())
         ON CONFLICT (player_id) DO NOTHING
         RETURNING data, updated_at
       `;
       const r2 = await pool.query(ins, [playerId]);
-      if (r2.rows.length > 0) {
-        return res.json(r2.rows[0]);
-      }
-      // (yarış durumunda başka satır oluşmuş olabilir)
+      if (r2.rows.length > 0) return res.json(r2.rows[0]);
+
       const r3 = await pool.query(q, [playerId]);
       return res.json(r3.rows[0] ?? { data: {}, updated_at: new Date().toISOString() });
     }
@@ -92,7 +102,7 @@ app.get("/sync/snapshot", requireAuth, async (req, res) => {
   }
 });
 
-// POST /sync/merge  -> gelen JSON'u mevcutla birleştir ve kaydet
+// POST merge
 app.post("/sync/merge", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -103,10 +113,9 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "no_data" });
     }
 
-    // UPSERT + JSON merge
     const q = `
       INSERT INTO profiles (player_id, data, updated_at)
-      VALUES ($1, $2::jsonb, now())
+      VALUES ($1::uuid, $2::jsonb, now())
       ON CONFLICT (player_id) DO UPDATE
       SET
         data = COALESCE(profiles.data, '{}'::jsonb) || EXCLUDED.data,
@@ -123,11 +132,8 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
   }
 });
 
-/* -----------------------------------------------------------------------
-   (Opsiyonel) /auth/google mevcut akışın — dokunmadım.
-   Google auth code exchange ve players/profiles yaratma sende nasılsa öyle.
-   Burayı ileride iyileştiririz.
-------------------------------------------------------------------------- */
+// ------------------- START -------------------
+await runMigrations();
 
 app.listen(PORT, () => {
   console.log(`API listening on :${PORT}`);
