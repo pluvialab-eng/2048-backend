@@ -26,6 +26,22 @@ app.use(express.json());
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+// --- JWT Middleware ---
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: "No token" });
+
+  const token = authHeader.split(" ")[1];
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.player = payload; // { playerId: ... }
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+// --- Google Auth ---
 app.post("/auth/google", async (req, res) => {
   try {
     const { authCode } = req.body;
@@ -42,14 +58,13 @@ app.post("/auth/google", async (req, res) => {
     const googleRes = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: params.toString(), // <--- netleştir
+      body: params.toString(),
     });
 
     const tokens = await googleRes.json();
 
     if (!googleRes.ok) {
       console.error("Google token error:", { status: googleRes.status, tokens });
-      // hata detayını istemciye ilet ki Android’de görebilelim
       return res.status(400).json({ error: "google_token_error", detail: tokens });
     }
 
@@ -88,6 +103,55 @@ app.post("/auth/google", async (req, res) => {
   } catch (err) {
     console.error("auth/google exception:", err);
     return res.status(500).json({ error: "server_error", message: String(err) });
+  }
+});
+
+// --- Sync: Snapshot (çek) ---
+app.get("/sync/snapshot", requireAuth, async (req, res) => {
+  try {
+    const { playerId } = req.player;
+
+    const { rows } = await pool.query(
+      "SELECT data, updated_at FROM profiles WHERE player_id = $1",
+      [playerId]
+    );
+
+    if (rows.length === 0) {
+      // hiç profili yoksa oluştur
+      await pool.query(
+        "INSERT INTO profiles (player_id, data) VALUES ($1, $2)",
+        [playerId, {}]
+      );
+      return res.json({ data: {}, updated_at: new Date().toISOString() });
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "snapshot_failed" });
+  }
+});
+
+// --- Sync: Merge (kaydet) ---
+app.post("/sync/merge", requireAuth, async (req, res) => {
+  try {
+    const { playerId } = req.player;
+    const { data } = req.body;
+
+    if (!data) return res.status(400).json({ error: "no_data" });
+
+    const { rows } = await pool.query(
+      `UPDATE profiles
+       SET data = $1, updated_at = now()
+       WHERE player_id = $2
+       RETURNING data, updated_at`,
+      [data, playerId]
+    );
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "merge_failed" });
   }
 });
 
