@@ -7,7 +7,7 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
-import { OAuth2Client } from "google-auth-library";
+import { OAuth2Client, GoogleAuth } from "google-auth-library";
 
 dotenv.config();
 const { Pool } = pkg;
@@ -23,6 +23,10 @@ const {
   GOOGLE_CLIENT_ID = "",
   GOOGLE_CLIENT_SECRET = "",
   GOOGLE_REDIRECT_URI = "", // boş olabilir → 'postmessage' fallback
+
+  // IAP doğrulama için gerekli
+  GOOGLE_PLAY_PACKAGE = "",          // ör: com.example.a2048
+  GOOGLE_SERVICE_ACCOUNT_JSON = ""   // Service Account JSON (düz JSON ya da base64)
 } = process.env;
 
 const pool = new Pool({
@@ -248,6 +252,152 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
       table: err.table, constraint: err.constraint,
     });
     return res.status(500).json({ error: "merge_failed" });
+  }
+});
+
+/* ------------------- IAP VERIFY (YENİ) ------------------- */
+
+// Service Account ile Android Publisher token al
+async function getGoogleAccessTokenFromSA() {
+  if (!GOOGLE_SERVICE_ACCOUNT_JSON) {
+    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing");
+  }
+  let jsonStr = GOOGLE_SERVICE_ACCOUNT_JSON;
+  // base64 geldiyse çözmeyi dene
+  try {
+    if (!jsonStr.trim().startsWith("{")) {
+      jsonStr = Buffer.from(jsonStr, "base64").toString("utf-8");
+    }
+  } catch { /* ignore */ }
+  const credentials = JSON.parse(jsonStr);
+
+  const auth = new GoogleAuth({
+    credentials,
+    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+  });
+  const client = await auth.getClient();
+  const token = await client.getAccessToken();
+  if (!token || !token.token) throw new Error("Google access token alınamadı");
+  return token.token;
+}
+
+// Play ürün satın alımını doğrula
+async function verifyPurchaseWithPlay({ packageName, productId, token }) {
+  const accessToken = await getGoogleAccessTokenFromSA();
+  const url = `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(packageName)}/purchases/products/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(token)}`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const text = await res.text();
+  let json = {};
+  try { json = JSON.parse(text); } catch {}
+  return { status: res.status, json, raw: text };
+}
+
+// profiles.data->'coins' değerini arttır
+async function incrementCoins(client, playerId, delta) {
+  const q = `
+    UPDATE profiles
+    SET data = jsonb_set(
+          data,
+          '{coins}',
+          to_jsonb( COALESCE( (data->>'coins')::INT, 0 ) + $2 ),
+          true
+        ),
+        updated_at = now()
+    WHERE player_id = $1::int
+    RETURNING (data->>'coins')::INT AS coins;
+  `;
+  const { rows } = await client.query(q, [playerId, delta]);
+  return rows?.[0]?.coins ?? null;
+}
+
+// Ürün → coin miktarı (client ile birebir)
+const COIN_PRODUCTS = {
+  "coins_150": 150,
+  "coins_300": 300,
+  "coins_800": 800,
+  "coins_2000": 2000,
+};
+
+// POST /iap/verify
+// Body: { productId, purchaseToken } + Authorization: Bearer <JWT>
+app.post("/iap/verify", requireAuth, async (req, res) => {
+  try {
+    const { playerId } = req.player;
+    const { productId, purchaseToken } = req.body || {};
+
+    if (!productId || !purchaseToken) {
+      return res.status(400).json({ error: "missing_params" });
+    }
+    if (!GOOGLE_PLAY_PACKAGE || !GOOGLE_SERVICE_ACCOUNT_JSON) {
+      return res.status(500).json({ error: "server_not_configured" });
+    }
+
+    // Token daha önce kullanılmış mı? (unique constraint yine güvence ama erken çıkış iyi)
+    const dup = await pool.query(
+      "SELECT id FROM iap_tokens WHERE token = $1",
+      [purchaseToken]
+    );
+    if (dup.rowCount > 0) {
+      return res.status(409).json({ error: "token_already_used" });
+    }
+
+    // Play doğrulaması
+    const result = await verifyPurchaseWithPlay({
+      packageName: GOOGLE_PLAY_PACKAGE,
+      productId,
+      token: purchaseToken,
+    });
+
+    const purchased = result.status === 200 &&
+                      result.json &&
+                      result.json.purchaseState === 0; // purchased
+
+    if (!purchased) {
+      // logla (rejected)
+      await pool.query(
+        `INSERT INTO iap_tokens (player_id, product_id, token, amount, state, raw_response)
+         VALUES ($1,$2,$3,$4,'rejected',$5)`,
+        [playerId, productId, purchaseToken, 0, result.json || {}]
+      );
+      return res.status(400).json({ error: "not_purchased", play: result.json || null });
+    }
+
+    const amount = COIN_PRODUCTS[productId] || 0;
+    if (amount <= 0) {
+      return res.status(400).json({ error: "unknown_product" });
+    }
+
+    // Tek transaction: token kaydet + coin ekle
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      await client.query(
+        `INSERT INTO iap_tokens (player_id, product_id, token, amount, state, raw_response)
+         VALUES ($1,$2,$3,$4,'credited',$5)`,
+        [playerId, productId, purchaseToken, amount, result.json || {}]
+      );
+
+      const newCoins = await incrementCoins(client, playerId, amount);
+
+      await client.query("COMMIT");
+      client.release();
+
+      return res.json({ ok: true, amount, newCoins });
+    } catch (e) {
+      try { await client.query("ROLLBACK"); client.release(); } catch {}
+      // benzersiz token ihlali vb.
+      if (String(e.message || "").includes("duplicate key")) {
+        return res.status(409).json({ error: "token_already_used" });
+      }
+      throw e;
+    }
+  } catch (err) {
+    console.error("iap_verify_failed:", {
+      code: err.code, detail: err.detail, message: err.message,
+      table: err.table, constraint: err.constraint,
+    });
+    return res.status(500).json({ error: "server_error" });
   }
 });
 
