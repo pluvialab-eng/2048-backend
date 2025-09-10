@@ -20,10 +20,10 @@ const {
   ALLOWED_ORIGIN = "*",
   JWT_SECRET = "change-me",
 
-  // Google OAuth (ID/Secret zorunlu; redirect boş ise 'postmessage' kullan)
+  
   GOOGLE_CLIENT_ID = "",
   GOOGLE_CLIENT_SECRET = "",
-  GOOGLE_REDIRECT_URI = "", // ör: "postmessage" ya da kayıtlı redirect URL'in
+  GOOGLE_REDIRECT_URI = "", //
 
   // IAP doğrulama için
   GOOGLE_PLAY_PACKAGE = "",          // ör: com.example.a2048
@@ -95,13 +95,16 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 
 /* ------------------- AUTH: /auth/google ------------------- */
 const oauthClient = new OAuth2Client({
-  clientId:     GOOGLE_CLIENT_ID || undefined,
-  clientSecret: GOOGLE_CLIENT_SECRET || undefined,
-  redirectUri:  (GOOGLE_REDIRECT_URI?.trim() || undefined),
+  clientId:     process.env.GOOGLE_CLIENT_ID || undefined,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET || undefined,
+  // Android/PGA için her zaman postmessage kullan
+  redirectUri:  "postmessage",
 });
 
 app.post("/auth/google", async (req, res) => {
   try {
+    const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, JWT_SECRET } = process.env;
+
     if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
       console.error("auth/google: missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET");
       return res.status(500).json({ error: "server_not_configured" });
@@ -112,8 +115,8 @@ app.post("/auth/google", async (req, res) => {
       return res.status(400).json({ error: "invalid_auth_code" });
     }
 
-    const redirectUri = GOOGLE_REDIRECT_URI?.trim() || "postmessage";
-    const { tokens } = await oauthClient.getToken({ code, redirect_uri: redirectUri });
+    // >>> postmessage sabit <<<
+    const { tokens } = await oauthClient.getToken({ code, redirect_uri: "postmessage" });
 
     const idToken = tokens.id_token;
     if (!idToken) {
@@ -125,6 +128,7 @@ app.post("/auth/google", async (req, res) => {
       idToken,
       audience: GOOGLE_CLIENT_ID,
     });
+
     const payload = ticket.getPayload();
     const sub = payload?.sub;
     if (!sub) {
@@ -132,6 +136,8 @@ app.post("/auth/google", async (req, res) => {
     }
 
     const playerId = makePlayerIdFromSub(sub);
+
+    // >>> JWT ÜRETİMİ — dokunmuyoruz <<<
     const appJwt = jwt.sign({ playerId }, JWT_SECRET, { expiresIn: "30d" });
 
     return res.json({
