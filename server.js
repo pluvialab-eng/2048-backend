@@ -61,14 +61,12 @@ async function runMigrations() {
 
 /* ------------------- HELPERS ------------------- */
 function makePlayerIdFromSub(sub) {
-  // Google 'sub' → stabil integer (32-bit) üret
   let h = 2166136261 >>> 0;
   const s = String(sub);
   for (let i = 0; i < s.length; i++) {
     h ^= s.charCodeAt(i);
     h = Math.imul(h, 16777619) >>> 0;
   }
-  // 1..2_147_483_647 aralığına
   const int31 = (h & 0x7fffffff) || 1;
   return int31;
 }
@@ -115,7 +113,6 @@ app.post("/auth/google", async (req, res) => {
 
     const redirectUri = GOOGLE_REDIRECT_URI?.trim() || "";
 
-    // Kodu token’a çevir
     const { tokens } = await oauthClient.getToken({
       code,
       redirect_uri: redirectUri,
@@ -127,7 +124,6 @@ app.post("/auth/google", async (req, res) => {
       return res.status(400).json({ error: "no_id_token" });
     }
 
-    // id_token doğrula
     const ticket = await oauthClient.verifyIdToken({
       idToken,
       audience: GOOGLE_CLIENT_ID,
@@ -139,8 +135,6 @@ app.post("/auth/google", async (req, res) => {
     }
 
     const playerId = makePlayerIdFromSub(sub);
-
-    // Uygulamanın kullanacağı kendi JWT’si
     const appJwt = jwt.sign({ playerId }, JWT_SECRET, { expiresIn: "30d" });
 
     return res.json({
@@ -155,7 +149,6 @@ app.post("/auth/google", async (req, res) => {
 });
 
 /* ------------------- SYNC ------------------- */
-// GET snapshot
 app.get("/sync/snapshot", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -191,7 +184,6 @@ app.get("/sync/snapshot", requireAuth, async (req, res) => {
   }
 });
 
-// Yardımcı: payload anlamlı mı?
 function hasMeaningfulData(obj) {
   if (!obj || typeof obj !== "object") return false;
   const keys = Object.keys(obj);
@@ -206,20 +198,17 @@ function hasMeaningfulData(obj) {
   return false;
 }
 
-// POST merge
 app.post("/sync/merge", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
     const body = req.body || {};
     const data = body.data;
 
-    // Boş/anlamsız merge => hiçbir şeyi ezme, mevcut kaydı döndür
     if (!hasMeaningfulData(data)) {
       const q0 = `SELECT data, updated_at FROM profiles WHERE player_id = $1::int`;
       const r0 = await pool.query(q0, [playerId]);
       if (r0.rows.length > 0) return res.json(r0.rows[0]);
 
-      // kayıt yoksa oluştur ve boş döndür
       const ins = `
         INSERT INTO profiles (player_id, data, updated_at)
         VALUES ($1::int, '{}'::jsonb, now())
@@ -263,12 +252,11 @@ async function getGoogleAccessTokenFromSA() {
     throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing");
   }
   let jsonStr = GOOGLE_SERVICE_ACCOUNT_JSON;
-  // base64 geldiyse çözmeyi dene
   try {
     if (!jsonStr.trim().startsWith("{")) {
       jsonStr = Buffer.from(jsonStr, "base64").toString("utf-8");
     }
-  } catch { /* ignore */ }
+  } catch {}
   const credentials = JSON.parse(jsonStr);
 
   const auth = new GoogleAuth({
@@ -292,14 +280,14 @@ async function verifyPurchaseWithPlay({ packageName, productId, token }) {
   return { status: res.status, json, raw: text };
 }
 
-// profiles.data->'coins' değerini arttır
+// profiles.data->'coins' değerini güvenli arttır
 async function incrementCoins(client, playerId, delta) {
   const q = `
     UPDATE profiles
     SET data = jsonb_set(
-          data,
+          COALESCE(data, '{}'::jsonb),                  -- data null ise boş obje
           '{coins}',
-          to_jsonb( COALESCE( (data->>'coins')::INT, 0 ) + $2 ),
+          to_jsonb( COALESCE(NULLIF(data->>'coins','')::INT, 0) + $2 ),  -- ''/null güvenli
           true
         ),
         updated_at = now()
@@ -318,8 +306,39 @@ const COIN_PRODUCTS = {
   "coins_2000": 2000,
 };
 
+// --- DEBUG: SA & paket hızlı kontrolü ---
+app.get("/debug/iap-config", (_req, res) => {
+  try {
+    let jsonStr = GOOGLE_SERVICE_ACCOUNT_JSON || "";
+    if (!jsonStr) return res.status(500).json({ error: "GOOGLE_SERVICE_ACCOUNT_JSON missing" });
+    try {
+      if (!jsonStr.trim().startsWith("{")) {
+        jsonStr = Buffer.from(jsonStr, "base64").toString("utf-8");
+      }
+    } catch {}
+    const sa = JSON.parse(jsonStr);
+    return res.json({
+      ok: true,
+      client_email: sa.client_email,
+      project_id: sa.project_id,
+      package: GOOGLE_PLAY_PACKAGE
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// --- DEBUG: Android Publisher erişim tokenı alabiliyor muyuz? ---
+app.get("/debug/iap-token", async (_req, res) => {
+  try {
+    await getGoogleAccessTokenFromSA();
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 // POST /iap/verify
-// Body: { productId, purchaseToken } + Authorization: Bearer <JWT>
 app.post("/iap/verify", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -332,7 +351,6 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
       return res.status(500).json({ error: "server_not_configured" });
     }
 
-    // Token daha önce kullanılmış mı? (unique constraint yine güvence ama erken çıkış iyi)
     const dup = await pool.query(
       "SELECT id FROM iap_tokens WHERE token = $1",
       [purchaseToken]
@@ -348,18 +366,21 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
       token: purchaseToken,
     });
 
+    console.log("playVerify", result.status, JSON.stringify(result.json)); // <-- LOG
+
     const purchased = result.status === 200 &&
                       result.json &&
                       result.json.purchaseState === 0; // purchased
 
     if (!purchased) {
-      // logla (rejected)
       await pool.query(
         `INSERT INTO iap_tokens (player_id, product_id, token, amount, state, raw_response)
          VALUES ($1,$2,$3,$4,'rejected',$5)`,
         [playerId, productId, purchaseToken, 0, result.json || {}]
       );
-      return res.status(400).json({ error: "not_purchased", play: result.json || null });
+      // 401/403'te gerçek HTTP kodunu yansıt
+      const code = (result.status === 401 || result.status === 403) ? result.status : 400;
+      return res.status(code).json({ error: "not_purchased", play: result.json || null });
     }
 
     const amount = COIN_PRODUCTS[productId] || 0;
@@ -386,7 +407,6 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
       return res.json({ ok: true, amount, newCoins });
     } catch (e) {
       try { await client.query("ROLLBACK"); client.release(); } catch {}
-      // benzersiz token ihlali vb.
       if (String(e.message || "").includes("duplicate key")) {
         return res.status(409).json({ error: "token_already_used" });
       }
