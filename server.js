@@ -7,7 +7,8 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
-import { OAuth2Client, GoogleAuth } from "google-auth-library";
+import { OAuth2Client } from "google-auth-library";
+import { google } from "googleapis";
 
 dotenv.config();
 const { Pool } = pkg;
@@ -19,12 +20,12 @@ const {
   ALLOWED_ORIGIN = "*",
   JWT_SECRET = "change-me",
 
-  // Google OAuth (ID/Secret zorunlu; redirect boş ise 'postmessage' kullanılacak)
+  // Google OAuth (ID/Secret zorunlu; redirect boş ise 'postmessage' kullan)
   GOOGLE_CLIENT_ID = "",
   GOOGLE_CLIENT_SECRET = "",
-  GOOGLE_REDIRECT_URI = "", // boş olabilir → 'postmessage' fallback
+  GOOGLE_REDIRECT_URI = "", // ör: "postmessage" ya da kayıtlı redirect URL'in
 
-  // IAP doğrulama için gerekli
+  // IAP doğrulama için
   GOOGLE_PLAY_PACKAGE = "",          // ör: com.example.a2048
   GOOGLE_SERVICE_ACCOUNT_JSON = ""   // Service Account JSON (düz JSON ya da base64)
 } = process.env;
@@ -96,7 +97,7 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 const oauthClient = new OAuth2Client({
   clientId:     GOOGLE_CLIENT_ID || undefined,
   clientSecret: GOOGLE_CLIENT_SECRET || undefined,
-  redirectUri:  GOOGLE_REDIRECT_URI?.trim() || "",
+  redirectUri:  (GOOGLE_REDIRECT_URI?.trim() || undefined),
 });
 
 app.post("/auth/google", async (req, res) => {
@@ -111,12 +112,8 @@ app.post("/auth/google", async (req, res) => {
       return res.status(400).json({ error: "invalid_auth_code" });
     }
 
-    const redirectUri = GOOGLE_REDIRECT_URI?.trim() || "";
-
-    const { tokens } = await oauthClient.getToken({
-      code,
-      redirect_uri: redirectUri,
-    });
+    const redirectUri = GOOGLE_REDIRECT_URI?.trim() || "postmessage";
+    const { tokens } = await oauthClient.getToken({ code, redirect_uri: redirectUri });
 
     const idToken = tokens.id_token;
     if (!idToken) {
@@ -244,40 +241,32 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
   }
 });
 
-/* ------------------- IAP VERIFY (YENİ) ------------------- */
+/* ------------------- IAP VERIFY (googleapis ile) ------------------- */
 
-// Service Account ile Android Publisher token al
-async function getGoogleAccessTokenFromSA() {
+// SA JSON'u (düz JSON ya da base64) -> credentials objesi
+function loadServiceAccountCredentials() {
   if (!GOOGLE_SERVICE_ACCOUNT_JSON) {
     throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing");
   }
   let jsonStr = GOOGLE_SERVICE_ACCOUNT_JSON;
+  // Base64 ise decode et
   try {
     if (!jsonStr.trim().startsWith("{")) {
       jsonStr = Buffer.from(jsonStr, "base64").toString("utf-8");
     }
   } catch {}
-  const credentials = JSON.parse(jsonStr);
+  return JSON.parse(jsonStr);
+}
 
-  const auth = new GoogleAuth({
+// Android Publisher istemcisi
+async function getAndroidPublisher() {
+  const credentials = loadServiceAccountCredentials();
+  const auth = new google.auth.GoogleAuth({
     credentials,
     scopes: ["https://www.googleapis.com/auth/androidpublisher"],
   });
   const client = await auth.getClient();
-  const token = await client.getAccessToken();
-  if (!token || !token.token) throw new Error("Google access token alınamadı");
-  return token.token;
-}
-
-// Play ürün satın alımını doğrula
-async function verifyPurchaseWithPlay({ packageName, productId, token }) {
-  const accessToken = await getGoogleAccessTokenFromSA();
-  const url = `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(packageName)}/purchases/products/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(token)}`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
-  const text = await res.text();
-  let json = {};
-  try { json = JSON.parse(text); } catch {}
-  return { status: res.status, json, raw: text };
+  return google.androidpublisher({ version: "v3", auth: client });
 }
 
 // profiles.data->'coins' değerini güvenli arttır
@@ -285,9 +274,9 @@ async function incrementCoins(client, playerId, delta) {
   const q = `
     UPDATE profiles
     SET data = jsonb_set(
-          COALESCE(data, '{}'::jsonb),                  -- data null ise boş obje
+          COALESCE(data, '{}'::jsonb),
           '{coins}',
-          to_jsonb( COALESCE(NULLIF(data->>'coins','')::INT, 0) + $2 ),  -- ''/null güvenli
+          to_jsonb( COALESCE(NULLIF(data->>'coins','')::INT, 0) + $2 ),
           true
         ),
         updated_at = now()
@@ -309,14 +298,7 @@ const COIN_PRODUCTS = {
 // --- DEBUG: SA & paket hızlı kontrolü ---
 app.get("/debug/iap-config", (_req, res) => {
   try {
-    let jsonStr = GOOGLE_SERVICE_ACCOUNT_JSON || "";
-    if (!jsonStr) return res.status(500).json({ error: "GOOGLE_SERVICE_ACCOUNT_JSON missing" });
-    try {
-      if (!jsonStr.trim().startsWith("{")) {
-        jsonStr = Buffer.from(jsonStr, "base64").toString("utf-8");
-      }
-    } catch {}
-    const sa = JSON.parse(jsonStr);
+    const sa = loadServiceAccountCredentials();
     return res.json({
       ok: true,
       client_email: sa.client_email,
@@ -328,10 +310,11 @@ app.get("/debug/iap-config", (_req, res) => {
   }
 });
 
-// --- DEBUG: Android Publisher erişim tokenı alabiliyor muyuz? ---
+// --- DEBUG: Android Publisher erişimi test ---
 app.get("/debug/iap-token", async (_req, res) => {
   try {
-    await getGoogleAccessTokenFromSA();
+    // Basit bir "kimlik/erişim" testi: sadece istemci oluşturulabiliyor mu?
+    await getAndroidPublisher();
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e.message || e) });
@@ -351,6 +334,7 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
       return res.status(500).json({ error: "server_not_configured" });
     }
 
+    // Token double-spend engeli
     const dup = await pool.query(
       "SELECT id FROM iap_tokens WHERE token = $1",
       [purchaseToken]
@@ -359,28 +343,48 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "token_already_used" });
     }
 
-    // Play doğrulaması
-    const result = await verifyPurchaseWithPlay({
-      packageName: GOOGLE_PLAY_PACKAGE,
-      productId,
-      token: purchaseToken,
-    });
+    // Play doğrulaması (googleapis)
+    const publisher = await getAndroidPublisher();
+    let playRes, status = 200;
 
-    console.log("playVerify", result.status, JSON.stringify(result.json)); // <-- LOG
+    try {
+      playRes = await publisher.purchases.products.get({
+        packageName: GOOGLE_PLAY_PACKAGE,
+        productId,
+        token: purchaseToken,
+      });
+    } catch (e) {
+      // googleapis hatasında HTTP status çek
+      status = e?.response?.status || 500;
+      playRes = { data: e?.response?.data || { error: e.message } };
+    }
 
-    const purchased = result.status === 200 &&
-                      result.json &&
-                      result.json.purchaseState === 0; // purchased
+    const playJson = playRes?.data || {};
+    console.log("playVerify", status, JSON.stringify(playJson));
+
+    const purchased = (status === 200) &&
+                      playJson &&
+                      playJson.purchaseState === 0; // purchased
 
     if (!purchased) {
       await pool.query(
         `INSERT INTO iap_tokens (player_id, product_id, token, amount, state, raw_response)
          VALUES ($1,$2,$3,$4,'rejected',$5)`,
-        [playerId, productId, purchaseToken, 0, result.json || {}]
+        [playerId, productId, purchaseToken, 0, playJson]
       );
-      // 401/403'te gerçek HTTP kodunu yansıt
-      const code = (result.status === 401 || result.status === 403) ? result.status : 400;
-      return res.status(code).json({ error: "not_purchased", play: result.json || null });
+      const code = (status === 401 || status === 403) ? status : 400;
+      // Teşhis için yardımcı ipuçları
+      return res.status(code).json({
+        error: "not_purchased",
+        play: playJson,
+        hint: {
+          service_account_email: (() => {
+            try { return loadServiceAccountCredentials().client_email; } catch { return undefined; }
+          })(),
+          package: GOOGLE_PLAY_PACKAGE,
+          productId
+        }
+      });
     }
 
     const amount = COIN_PRODUCTS[productId] || 0;
@@ -396,7 +400,7 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
       await client.query(
         `INSERT INTO iap_tokens (player_id, product_id, token, amount, state, raw_response)
          VALUES ($1,$2,$3,$4,'credited',$5)`,
-        [playerId, productId, purchaseToken, amount, result.json || {}]
+        [playerId, productId, purchaseToken, amount, playJson]
       );
 
       const newCoins = await incrementCoins(client, playerId, amount);
