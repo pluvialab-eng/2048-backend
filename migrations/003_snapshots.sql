@@ -1,6 +1,9 @@
--- migrations/003_snapshots.sql — IDEMPOTENT
+-- migrations/003_snapshots.sql
+-- Sunucuda tutabileceğin ham snapshot arşivi (İSTEĞE BAĞLI).
+-- Tipler profiles ile aynı olsun: INTEGER player_id.
+DROP TABLE IF EXISTS snapshots CASCADE;
 
-CREATE TABLE IF NOT EXISTS snapshots (
+CREATE TABLE snapshots (
   player_id          INTEGER PRIMARY KEY,
   data               JSONB NOT NULL DEFAULT '{}'::jsonb,
   client_updated_at  TIMESTAMPTZ,

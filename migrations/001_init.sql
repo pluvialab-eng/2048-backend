@@ -1,14 +1,18 @@
 -- =========================
--- 001_init.sql (INT player_id mimarisi) — IDEMPOTENT
+-- 001_init.sql (INT player_id mimarisi)
 -- =========================
 
--- NOT: Üretimde DROP yok. Tüm CREATE'ler IF NOT EXISTS.
+-- Sıfırdan uyumlu şema için (veri yoksa tavsiye edilir)
+DROP TABLE IF EXISTS coin_ledger CASCADE;
+DROP TABLE IF EXISTS runs CASCADE;
+DROP TABLE IF EXISTS progress CASCADE;
+DROP TABLE IF EXISTS players CASCADE;
 
 -- players: uygulamanın ürettiği deterministik kimlik (INTEGER)
-CREATE TABLE IF NOT EXISTS players (
+CREATE TABLE players (
   id            INTEGER PRIMARY KEY,          -- makePlayerIdFromSub(sub)
-  google_sub    TEXT UNIQUE,
-  pgs_player_id TEXT UNIQUE,
+  google_sub    TEXT UNIQUE,                  -- Google 'sub'
+  pgs_player_id TEXT UNIQUE,                  -- (opsiyonel) PGS player id
   display_name  TEXT,
   country_code  TEXT,
   coins         INT NOT NULL DEFAULT 0,
@@ -26,38 +30,34 @@ BEGIN
 END$$;
 
 -- mod başına tek satır (upsert edilebilir)
-CREATE TABLE IF NOT EXISTS progress (
-  player_id    INTEGER     NOT NULL REFERENCES players(id) ON DELETE CASCADE,
-  mode         game_mode   NOT NULL,
-  best_score   INT         NOT NULL DEFAULT 0,
-  best_tile    INT         NOT NULL DEFAULT 0,
-  games_played INT         NOT NULL DEFAULT 0,
-  total_moves  BIGINT      NOT NULL DEFAULT 0,
-  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+CREATE TABLE progress (
+  player_id   INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+  mode        game_mode NOT NULL,
+  best_score  INT NOT NULL DEFAULT 0,
+  best_tile   INT NOT NULL DEFAULT 0,
+  games_played INT NOT NULL DEFAULT 0,
+  total_moves BIGINT NOT NULL DEFAULT 0,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (player_id, mode)
 );
 
 -- tek tek maç geçmişi / skor koşuları
-CREATE TABLE IF NOT EXISTS runs (
-  id          BIGSERIAL PRIMARY KEY,
-  player_id   INTEGER   NOT NULL REFERENCES players(id) ON DELETE CASCADE,
-  mode        game_mode NOT NULL,
-  score       INT       NOT NULL,
-  max_tile    INT       NOT NULL,
-  duration_ms BIGINT,
-  moves       INT,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- coin hareketleri (audit)
-CREATE TABLE IF NOT EXISTS coin_ledger (
+CREATE TABLE runs (
   id         BIGSERIAL PRIMARY KEY,
   player_id  INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
-  delta      INT      NOT NULL,     -- +/- 
-  reason     TEXT,
+  mode       game_mode NOT NULL,
+  score      INT NOT NULL,
+  max_tile   INT NOT NULL,
+  duration_ms BIGINT,
+  moves      INT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Faydalı indexler
-CREATE INDEX IF NOT EXISTS runs_player_created_idx ON runs(player_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS coin_ledger_player_created_idx ON coin_ledger(player_id, created_at DESC);
+-- coin hareketleri (audit)
+CREATE TABLE coin_ledger (
+  id         BIGSERIAL PRIMARY KEY,
+  player_id  INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+  delta      INT      NOT NULL,     -- +/-
+  reason     TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
