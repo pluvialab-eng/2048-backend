@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import jwt from "jsonwebtoken";
@@ -140,7 +139,6 @@ app.post("/auth/google", async (req, res) => {
 });
 
 /* ------------------- MERGE/SNAPSHOT KORUMALARI ------------------- */
-// payload hijyen & derin birleştirme
 function isPlainObject(v) { return v && typeof v === "object" && !Array.isArray(v); }
 
 function stripEmpty(obj) {
@@ -190,9 +188,10 @@ app.get("/sync/snapshot", requireAuth, async (req, res) => {
     const { rows } = await pool.query(q, [playerId]);
 
     if (rows.length === 0) {
+      // COINS anahtarını varsayılan 0 ile oluştur
       const ins = `
         INSERT INTO profiles (player_id, data, updated_at)
-        VALUES ($1::int, '{}'::jsonb, now())
+        VALUES ($1::int, '{"coins":0}'::jsonb, now())
         ON CONFLICT (player_id) DO NOTHING
         RETURNING data, updated_at
       `;
@@ -200,7 +199,7 @@ app.get("/sync/snapshot", requireAuth, async (req, res) => {
       if (r2.rows.length > 0) return res.json(r2.rows[0]);
 
       const r3 = await pool.query(q, [playerId]);
-      return res.json(r3.rows[0] ?? { data: {}, updated_at: new Date().toISOString() });
+      return res.json(r3.rows[0] ?? { data: { coins: 0 }, updated_at: new Date().toISOString() });
     }
 
     return res.json(rows[0]);
@@ -234,12 +233,12 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
 
       const ins = `
         INSERT INTO profiles (player_id, data, updated_at)
-        VALUES ($1::int, '{}'::jsonb, now())
+        VALUES ($1::int, '{"coins":0}'::jsonb, now())
         ON CONFLICT (player_id) DO NOTHING
         RETURNING data, updated_at
       `;
       const r1 = await pool.query(ins, [playerId]);
-      return res.json(r1.rows[0] ?? { data: {}, updated_at: new Date().toISOString() });
+      return res.json(r1.rows[0] ?? { data: { coins: 0 }, updated_at: new Date().toISOString() });
     }
 
     // 4) Mevcutu çek, JS tarafında derin birleştir, sonra UPDATE
@@ -253,7 +252,8 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
         "INSERT INTO profiles (player_id, data, updated_at) VALUES ($1::int, $2::jsonb, now()) ON CONFLICT (player_id) DO NOTHING RETURNING data, updated_at",
         [playerId, JSON.stringify(data)]
       );
-      return res.json(r.rows[0] ?? { data, updated_at: new Date().toISOString() });
+      // Trigger coins'i oluşturur
+      return res.json(r.rows[0] ?? { data: { ...data, coins: 0 }, updated_at: new Date().toISOString() });
     } else {
       const merged = deepMergeKeepExisting(cur.rows[0].data, data);
       const r = await pool.query(
