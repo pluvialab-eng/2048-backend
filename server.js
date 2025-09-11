@@ -20,14 +20,13 @@ const {
   ALLOWED_ORIGIN = "*",
   JWT_SECRET = "change-me",
 
-  
   GOOGLE_CLIENT_ID = "",
   GOOGLE_CLIENT_SECRET = "",
-  GOOGLE_REDIRECT_URI = "", //
+  GOOGLE_REDIRECT_URI = "", // Android için boş/postmessage
 
   // IAP doğrulama için
-  GOOGLE_PLAY_PACKAGE = "",          // ör: com.example.a2048
-  GOOGLE_SERVICE_ACCOUNT_JSON = ""   // Service Account JSON (düz JSON ya da base64)
+  GOOGLE_PLAY_PACKAGE = "",
+  GOOGLE_SERVICE_ACCOUNT_JSON = ""
 } = process.env;
 
 const pool = new Pool({
@@ -95,16 +94,13 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 
 /* ------------------- AUTH: /auth/google ------------------- */
 const oauthClient = new OAuth2Client({
-  clientId:     process.env.GOOGLE_CLIENT_ID || undefined,
-  clientSecret: process.env.GOOGLE_CLIENT_SECRET || undefined,
-  // Android/PGA için her zaman postmessage kullan
-  redirectUri:  "",
+  clientId:     GOOGLE_CLIENT_ID || undefined,
+  clientSecret: GOOGLE_CLIENT_SECRET || undefined,
+  redirectUri:  "", // Android: postmessage akışı
 });
 
 app.post("/auth/google", async (req, res) => {
   try {
-    const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, JWT_SECRET } = process.env;
-
     if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
       console.error("auth/google: missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET");
       return res.status(500).json({ error: "server_not_configured" });
@@ -115,9 +111,8 @@ app.post("/auth/google", async (req, res) => {
       return res.status(400).json({ error: "invalid_auth_code" });
     }
 
-    // >>> postmessage sabit <<<
+    // postmessage
     const { tokens } = await oauthClient.getToken({ code, redirect_uri: "" });
-
     const idToken = tokens.id_token;
     if (!idToken) {
       console.error("auth/google: no id_token on token response", tokens);
@@ -131,25 +126,56 @@ app.post("/auth/google", async (req, res) => {
 
     const payload = ticket.getPayload();
     const sub = payload?.sub;
-    if (!sub) {
-      return res.status(400).json({ error: "invalid_id_token" });
-    }
+    if (!sub) return res.status(400).json({ error: "invalid_id_token" });
 
     const playerId = makePlayerIdFromSub(sub);
-
-    // >>> JWT ÜRETİMİ — dokunmuyoruz <<<
     const appJwt = jwt.sign({ playerId }, JWT_SECRET, { expiresIn: "30d" });
 
-    return res.json({
-      token: appJwt,
-      player: { playerId, googleSub: sub },
-    });
+    return res.json({ token: appJwt, player: { playerId, googleSub: sub } });
   } catch (err) {
     console.error("auth/google failed:", err?.response?.data || err?.message || err);
     const status = err?.response?.status || 500;
     return res.status(status).json({ error: "auth_failed" });
   }
 });
+
+/* ------------------- MERGE/SNAPSHOT KORUMALARI ------------------- */
+// payload hijyen & derin birleştirme
+function isPlainObject(v) { return v && typeof v === "object" && !Array.isArray(v); }
+
+function stripEmpty(obj) {
+  if (!isPlainObject(obj)) return obj;
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === null || v === undefined) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    if (isPlainObject(v)) {
+      const nested = stripEmpty(v);
+      if (Object.keys(nested).length === 0) continue;
+      out[k] = nested;
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function deepMergeKeepExisting(base, incoming) {
+  if (!isPlainObject(incoming) || Object.keys(incoming).length === 0) return base || {};
+  const out = { ...(base || {}) };
+  for (const [k, v] of Object.entries(incoming)) {
+    if (v === null || v === undefined) continue;
+    if (isPlainObject(v) && isPlainObject(out[k])) {
+      out[k] = deepMergeKeepExisting(out[k], v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+// Sunucu-otoriter anahtarlar (client'tan asla yazılmayacak)
+const SERVER_AUTH_KEYS = new Set(["coins"]);
 
 /* ------------------- SYNC ------------------- */
 app.get("/sync/snapshot", requireAuth, async (req, res) => {
@@ -187,27 +213,21 @@ app.get("/sync/snapshot", requireAuth, async (req, res) => {
   }
 });
 
-function hasMeaningfulData(obj) {
-  if (!obj || typeof obj !== "object") return false;
-  const keys = Object.keys(obj);
-  if (keys.length === 0) return false;
-  for (const k of keys) {
-    const v = obj[k];
-    if (v === null || v === undefined) continue;
-    if (typeof v === "number" && v !== 0) return true;
-    if (typeof v === "string" && v.trim() !== "") return true;
-    if (typeof v === "object" && Object.keys(v).length > 0) return true;
-  }
-  return false;
-}
-
 app.post("/sync/merge", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
-    const body = req.body || {};
-    const data = body.data;
+    let data = (req.body && req.body.data) || {};
 
-    if (!hasMeaningfulData(data)) {
+    // 1) Boşları temizle
+    data = stripEmpty(data);
+
+    // 2) Sunucu-otoriter alanları kaldır (coins vs.)
+    for (const k of SERVER_AUTH_KEYS) {
+      if (k in data) delete data[k];
+    }
+
+    // 3) Tamamen boşsa yazma; mevcudu döndür veya boş satır oluştur
+    if (!data || Object.keys(data).length === 0) {
       const q0 = `SELECT data, updated_at FROM profiles WHERE player_id = $1::int`;
       const r0 = await pool.query(q0, [playerId]);
       if (r0.rows.length > 0) return res.json(r0.rows[0]);
@@ -222,22 +242,26 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
       return res.json(r1.rows[0] ?? { data: {}, updated_at: new Date().toISOString() });
     }
 
-    const q = `
-      INSERT INTO profiles (player_id, data, updated_at)
-      VALUES ($1::int, $2::jsonb, now())
-      ON CONFLICT (player_id) DO UPDATE
-      SET
-        data = CASE
-                 WHEN EXCLUDED.data = '{}'::jsonb THEN profiles.data
-                 ELSE COALESCE(profiles.data, '{}'::jsonb) || EXCLUDED.data
-               END,
-        updated_at = now()
-      RETURNING data, updated_at
-    `;
-    const params = [playerId, JSON.stringify(data)];
-    const { rows } = await pool.query(q, params);
+    // 4) Mevcutu çek, JS tarafında derin birleştir, sonra UPDATE
+    const cur = await pool.query(
+      "SELECT data FROM profiles WHERE player_id=$1::int",
+      [playerId]
+    );
 
-    return res.json(rows[0]);
+    if (cur.rows.length === 0) {
+      const r = await pool.query(
+        "INSERT INTO profiles (player_id, data, updated_at) VALUES ($1::int, $2::jsonb, now()) ON CONFLICT (player_id) DO NOTHING RETURNING data, updated_at",
+        [playerId, JSON.stringify(data)]
+      );
+      return res.json(r.rows[0] ?? { data, updated_at: new Date().toISOString() });
+    } else {
+      const merged = deepMergeKeepExisting(cur.rows[0].data, data);
+      const r = await pool.query(
+        "UPDATE profiles SET data=$2::jsonb, updated_at=now() WHERE player_id=$1::int RETURNING data, updated_at",
+        [playerId, JSON.stringify(merged)]
+      );
+      return res.json(r.rows[0]);
+    }
   } catch (err) {
     console.error("merge_failed:", {
       code: err.code, detail: err.detail, message: err.message,
@@ -249,13 +273,12 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
 
 /* ------------------- IAP VERIFY (googleapis ile) ------------------- */
 
-// SA JSON'u (düz JSON ya da base64) -> credentials objesi
+// SA JSON'u (düz JSON ya da base64) -> credentials
 function loadServiceAccountCredentials() {
   if (!GOOGLE_SERVICE_ACCOUNT_JSON) {
     throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing");
   }
   let jsonStr = GOOGLE_SERVICE_ACCOUNT_JSON;
-  // Base64 ise decode et
   try {
     if (!jsonStr.trim().startsWith("{")) {
       jsonStr = Buffer.from(jsonStr, "base64").toString("utf-8");
@@ -264,7 +287,6 @@ function loadServiceAccountCredentials() {
   return JSON.parse(jsonStr);
 }
 
-// Android Publisher istemcisi
 async function getAndroidPublisher() {
   const credentials = loadServiceAccountCredentials();
   const auth = new google.auth.GoogleAuth({
@@ -275,7 +297,7 @@ async function getAndroidPublisher() {
   return google.androidpublisher({ version: "v3", auth: client });
 }
 
-// profiles.data->'coins' değerini güvenli arttır
+// profiles.data->'coins' güvenli arttır (tek transaction içinde client query'siyle)
 async function incrementCoins(client, playerId, delta) {
   const q = `
     UPDATE profiles
@@ -293,7 +315,7 @@ async function incrementCoins(client, playerId, delta) {
   return rows?.[0]?.coins ?? null;
 }
 
-// Ürün → coin miktarı (client ile birebir)
+// Ürün → coin miktarı
 const COIN_PRODUCTS = {
   "coins_150": 150,
   "coins_300": 300,
@@ -301,7 +323,7 @@ const COIN_PRODUCTS = {
   "coins_2000": 2000,
 };
 
-// --- DEBUG: SA & paket hızlı kontrolü ---
+// Debug yardımcıları
 app.get("/debug/iap-config", (_req, res) => {
   try {
     const sa = loadServiceAccountCredentials();
@@ -316,10 +338,8 @@ app.get("/debug/iap-config", (_req, res) => {
   }
 });
 
-// --- DEBUG: Android Publisher erişimi test ---
 app.get("/debug/iap-token", async (_req, res) => {
   try {
-    // Basit bir "kimlik/erişim" testi: sadece istemci oluşturulabiliyor mu?
     await getAndroidPublisher();
     return res.json({ ok: true });
   } catch (e) {
@@ -327,7 +347,7 @@ app.get("/debug/iap-token", async (_req, res) => {
   }
 });
 
-// POST /iap/verify
+// Token doğrulama + coin ekleme
 app.post("/iap/verify", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -340,7 +360,7 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
       return res.status(500).json({ error: "server_not_configured" });
     }
 
-    // Token double-spend engeli
+    // Double-spend engeli
     const dup = await pool.query(
       "SELECT id FROM iap_tokens WHERE token = $1",
       [purchaseToken]
@@ -349,7 +369,7 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "token_already_used" });
     }
 
-    // Play doğrulaması (googleapis)
+    // Play doğrulaması
     const publisher = await getAndroidPublisher();
     let playRes, status = 200;
 
@@ -360,7 +380,6 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
         token: purchaseToken,
       });
     } catch (e) {
-      // googleapis hatasında HTTP status çek
       status = e?.response?.status || 500;
       playRes = { data: e?.response?.data || { error: e.message } };
     }
@@ -379,7 +398,6 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
         [playerId, productId, purchaseToken, 0, playJson]
       );
       const code = (status === 401 || status === 403) ? status : 400;
-      // Teşhis için yardımcı ipuçları
       return res.status(code).json({
         error: "not_purchased",
         play: playJson,
@@ -431,9 +449,18 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
   }
 });
 
+/* ------------------- DEBUG: profil teşhis ------------------- */
+app.get("/debug/profile", requireAuth, async (req, res) => {
+  const { playerId } = req.player;
+  const r = await pool.query(
+    "SELECT player_id, data, updated_at FROM profiles WHERE player_id=$1::int",
+    [playerId]
+  );
+  res.json({ playerId, row: r.rows[0] || null });
+});
+
 /* ------------------- START ------------------- */
 await runMigrations();
-
 app.listen(PORT, () => {
   console.log(`API listening on :${PORT}`);
 });
