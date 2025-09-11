@@ -98,7 +98,7 @@ const oauthClient = new OAuth2Client({
   clientId:     process.env.GOOGLE_CLIENT_ID || undefined,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET || undefined,
   // Android/PGA için her zaman postmessage kullan
-  redirectUri:  "postmessage",
+  redirectUri:  "",
 });
 
 app.post("/auth/google", async (req, res) => {
@@ -116,7 +116,7 @@ app.post("/auth/google", async (req, res) => {
     }
 
     // >>> postmessage sabit <<<
-    const { tokens } = await oauthClient.getToken({ code, redirect_uri: "postmessage" });
+    const { tokens } = await oauthClient.getToken({ code, redirect_uri: "" });
 
     const idToken = tokens.id_token;
     if (!idToken) {
