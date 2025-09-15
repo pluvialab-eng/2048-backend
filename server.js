@@ -20,10 +20,9 @@ const {
   ALLOWED_ORIGIN = "*",
   JWT_SECRET = "change-me",
 
-  
   GOOGLE_CLIENT_ID = "",
   GOOGLE_CLIENT_SECRET = "",
-  GOOGLE_REDIRECT_URI = "", //
+  GOOGLE_REDIRECT_URI = "",
 
   // IAP doğrulama için
   GOOGLE_PLAY_PACKAGE = "",          // ör: com.example.a2048
@@ -95,16 +94,14 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 
 /* ------------------- AUTH: /auth/google ------------------- */
 const oauthClient = new OAuth2Client({
-  clientId:     process.env.GOOGLE_CLIENT_ID || undefined,
-  clientSecret: process.env.GOOGLE_CLIENT_SECRET || undefined,
+  clientId:     GOOGLE_CLIENT_ID || undefined,
+  clientSecret: GOOGLE_CLIENT_SECRET || undefined,
   // Android/PGA için her zaman postmessage kullan
-  redirectUri:  "",
+  redirectUri:  "", // GOOGLE_REDIRECT_URI kullanılmıyor
 });
 
 app.post("/auth/google", async (req, res) => {
   try {
-    const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, JWT_SECRET } = process.env;
-
     if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
       console.error("auth/google: missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET");
       return res.status(500).json({ error: "server_not_configured" });
@@ -152,6 +149,43 @@ app.post("/auth/google", async (req, res) => {
 });
 
 /* ------------------- SYNC ------------------- */
+
+// === sanitize + deep-merge yardımcıları ===
+function isPlainObject(v) {
+  return v && typeof v === "object" && !Array.isArray(v);
+}
+function stripEmpty(obj) {
+  if (!isPlainObject(obj)) return obj;
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === null || v === undefined) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    if (isPlainObject(v)) {
+      const nested = stripEmpty(v);
+      if (Object.keys(nested).length === 0) continue;
+      out[k] = nested;
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+function deepMergeKeepExisting(base, incoming) {
+  if (!isPlainObject(incoming) || Object.keys(incoming).length === 0) return base || {};
+  const out = { ...(base || {}) };
+  for (const [k, v] of Object.entries(incoming)) {
+    if (v === null || v === undefined) continue;
+    if (isPlainObject(v) && isPlainObject(out[k])) {
+      out[k] = deepMergeKeepExisting(out[k], v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+// Sunucu otoriter alanlar: client’tan gelen payload’dan atılacak
+const SERVER_AUTH_KEYS = new Set(["coins"]);
+
 app.get("/sync/snapshot", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -187,27 +221,20 @@ app.get("/sync/snapshot", requireAuth, async (req, res) => {
   }
 });
 
-function hasMeaningfulData(obj) {
-  if (!obj || typeof obj !== "object") return false;
-  const keys = Object.keys(obj);
-  if (keys.length === 0) return false;
-  for (const k of keys) {
-    const v = obj[k];
-    if (v === null || v === undefined) continue;
-    if (typeof v === "number" && v !== 0) return true;
-    if (typeof v === "string" && v.trim() !== "") return true;
-    if (typeof v === "object" && Object.keys(v).length > 0) return true;
-  }
-  return false;
-}
-
 app.post("/sync/merge", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
-    const body = req.body || {};
-    const data = body.data;
+    let data = (req.body && req.body.data) || {};
 
-    if (!hasMeaningfulData(data)) {
+    // 1) sanitize
+    data = stripEmpty(data);
+    // 2) otoriter alanları düşür (ör. coins)
+    for (const k of SERVER_AUTH_KEYS) {
+      if (k in data) delete data[k];
+    }
+
+    // 3) hâlâ boşsa: yazma; mevcut profili dön (yoksa boş satır oluştur)
+    if (!data || Object.keys(data).length === 0) {
       const q0 = `SELECT data, updated_at FROM profiles WHERE player_id = $1::int`;
       const r0 = await pool.query(q0, [playerId]);
       if (r0.rows.length > 0) return res.json(r0.rows[0]);
@@ -222,22 +249,32 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
       return res.json(r1.rows[0] ?? { data: {}, updated_at: new Date().toISOString() });
     }
 
-    const q = `
-      INSERT INTO profiles (player_id, data, updated_at)
-      VALUES ($1::int, $2::jsonb, now())
-      ON CONFLICT (player_id) DO UPDATE
-      SET
-        data = CASE
-                 WHEN EXCLUDED.data = '{}'::jsonb THEN profiles.data
-                 ELSE COALESCE(profiles.data, '{}'::jsonb) || EXCLUDED.data
-               END,
-        updated_at = now()
-      RETURNING data, updated_at
-    `;
-    const params = [playerId, JSON.stringify(data)];
-    const { rows } = await pool.query(q, params);
+    // 4) select + deep-merge + update (idempotent)
+    const cur = await pool.query(
+      "SELECT data FROM profiles WHERE player_id=$1::int",
+      [playerId]
+    );
 
-    return res.json(rows[0]);
+    if (cur.rows.length === 0) {
+      const r = await pool.query(
+        `INSERT INTO profiles (player_id, data, updated_at)
+         VALUES ($1::int, $2::jsonb, now())
+         ON CONFLICT (player_id) DO NOTHING
+         RETURNING data, updated_at`,
+        [playerId, JSON.stringify(data)]
+      );
+      return res.json(r.rows[0] ?? { data, updated_at: new Date().toISOString() });
+    } else {
+      const merged = deepMergeKeepExisting(cur.rows[0].data, data);
+      const r = await pool.query(
+        `UPDATE profiles
+           SET data=$2::jsonb, updated_at=now()
+         WHERE player_id=$1::int
+         RETURNING data, updated_at`,
+        [playerId, JSON.stringify(merged)]
+      );
+      return res.json(r.rows[0]);
+    }
   } catch (err) {
     console.error("merge_failed:", {
       code: err.code, detail: err.detail, message: err.message,
@@ -245,6 +282,16 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
     });
     return res.status(500).json({ error: "merge_failed" });
   }
+});
+
+// Küçük teşhis endpoint’i
+app.get("/debug/profile", requireAuth, async (req, res) => {
+  const { playerId } = req.player;
+  const r = await pool.query(
+    "SELECT player_id, data, updated_at FROM profiles WHERE player_id=$1::int",
+    [playerId]
+  );
+  res.json({ playerId, row: r.rows[0] || null });
 });
 
 /* ------------------- IAP VERIFY (googleapis ile) ------------------- */
@@ -319,7 +366,6 @@ app.get("/debug/iap-config", (_req, res) => {
 // --- DEBUG: Android Publisher erişimi test ---
 app.get("/debug/iap-token", async (_req, res) => {
   try {
-    // Basit bir "kimlik/erişim" testi: sadece istemci oluşturulabiliyor mu?
     await getAndroidPublisher();
     return res.json({ ok: true });
   } catch (e) {
@@ -360,7 +406,6 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
         token: purchaseToken,
       });
     } catch (e) {
-      // googleapis hatasında HTTP status çek
       status = e?.response?.status || 500;
       playRes = { data: e?.response?.data || { error: e.message } };
     }
@@ -379,7 +424,6 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
         [playerId, productId, purchaseToken, 0, playJson]
       );
       const code = (status === 401 || status === 403) ? status : 400;
-      // Teşhis için yardımcı ipuçları
       return res.status(code).json({
         error: "not_purchased",
         play: playJson,
