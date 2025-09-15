@@ -198,10 +198,7 @@ app.get("/sync/snapshot", requireAuth, async (req, res) => {
 
     return res.json(rows[0]);
   } catch (err) {
-    console.error("snapshot_failed:", {
-      code: err.code, detail: err.detail, message: err.message,
-      table: err.table, constraint: err.constraint,
-    });
+    console.error("snapshot_failed:", err);
     return res.status(500).json({ error: "snapshot_failed" });
   }
 });
@@ -218,17 +215,16 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
 
     // 3) hâlâ boşsa: yazma; mevcut profili dön (yoksa boş satır oluştur)
     if (!data || Object.keys(data).length === 0) {
-      const q0 = `SELECT data, updated_at FROM profiles WHERE player_id = $1::int`;
-      const r0 = await pool.query(q0, [playerId]);
+      const r0 = await pool.query(`SELECT data, updated_at FROM profiles WHERE player_id=$1::int`, [playerId]);
       if (r0.rows.length > 0) return res.json(r0.rows[0]);
 
-      const ins = `
-        INSERT INTO profiles (player_id, data, updated_at)
-        VALUES ($1::int, '{}'::jsonb, now())
-        ON CONFLICT (player_id) DO NOTHING
-        RETURNING data, updated_at
-      `;
-      const r1 = await pool.query(ins, [playerId]);
+      const r1 = await pool.query(
+        `INSERT INTO profiles (player_id, data, updated_at)
+         VALUES ($1::int, '{}'::jsonb, now())
+         ON CONFLICT (player_id) DO NOTHING
+         RETURNING data, updated_at`,
+        [playerId]
+      );
       return res.json(r1.rows[0] ?? { data: {}, updated_at: new Date().toISOString() });
     }
 
@@ -256,10 +252,7 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
       return res.json(r.rows[0]);
     }
   } catch (err) {
-    console.error("merge_failed:", {
-      code: err.code, detail: err.detail, message: err.message,
-      table: err.table, constraint: err.constraint,
-    });
+    console.error("merge_failed:", err);
     return res.status(500).json({ error: "merge_failed" });
   }
 });
@@ -315,32 +308,39 @@ async function incrementCoins(client, playerId, delta) {
   return rows?.[0]?.coins ?? null;
 }
 
-// profiles.data->'coins' güvenli azalt (yetersizse ok:false)
+// profiles.data->'coins' güvenli azalt (yetersizse UPDATE yapılmaz)
 async function decrementCoinsIfEnough(client, playerId, delta) {
   const q = `
     WITH cur AS (
       SELECT COALESCE(NULLIF(data->>'coins','')::INT, 0) AS bal
-      FROM profiles WHERE player_id = $1::int
+      FROM profiles
+      WHERE player_id = $1::int
       FOR UPDATE
-    ), upd AS (
+    ),
+    ok AS (
+      SELECT (bal >= $2) AS ok FROM cur
+    ),
+    upd AS (
       UPDATE profiles
          SET data = jsonb_set(
                COALESCE(data, '{}'::jsonb),
                '{coins}',
-               to_jsonb( GREATEST( (SELECT bal FROM cur) - $2, 0) ),
+               to_jsonb( (SELECT bal FROM cur) - $2 ),
                true
              ),
              updated_at = now()
-       WHERE player_id = $1::int
-     RETURNING (data->>'coins')::INT AS coins
+       WHERE player_id = $1::int AND (SELECT ok FROM ok)
+       RETURNING (data->>'coins')::INT AS coins
     )
-    SELECT (SELECT bal FROM cur) AS before, (SELECT coins FROM upd) AS after;
+    SELECT (SELECT bal FROM cur) AS before,
+           (SELECT coins FROM upd) AS after,
+           (SELECT ok FROM ok) AS ok;
   `;
   const { rows } = await client.query(q, [playerId, delta]);
   const before = rows?.[0]?.before ?? 0;
-  const after  = rows?.[0]?.after  ?? 0;
-  if (before < delta) return { ok: false, before, after };
-  return { ok: true, before, after };
+  const after  = rows?.[0]?.after ?? before;
+  const ok     = !!rows?.[0]?.ok;
+  return { ok, before, after };
 }
 
 // Ürün → coin miktarı (client ile birebir)
@@ -443,11 +443,21 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
         [playerId, productId, purchaseToken, amount, playJson]
       );
 
+      // profil yoksa önce oluştur (güvenlik)
+      await client.query(
+        `INSERT INTO profiles (player_id, data, updated_at)
+         VALUES ($1::int, '{}'::jsonb, now())
+         ON CONFLICT (player_id) DO NOTHING`,
+        [playerId]
+      );
+
+      const before = await getCoinsNow(playerId);
       const newCoins = await incrementCoins(client, playerId, amount);
 
       await client.query("COMMIT");
       client.release();
 
+      console.log(`[iap_verify] player=${playerId} before=${before} +${amount} => after=${newCoins}`);
       return res.json({ ok: true, amount, newCoins });
     } catch (e) {
       try { await client.query("ROLLBACK"); client.release(); } catch {}
@@ -457,10 +467,7 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
       throw e;
     }
   } catch (err) {
-    console.error("iap_verify_failed:", {
-      code: err.code, detail: err.detail, message: err.message,
-      table: err.table, constraint: err.constraint,
-    });
+    console.error("iap_verify_failed:", err);
     return res.status(500).json({ error: "server_error" });
   }
 });
@@ -524,33 +531,33 @@ app.post("/wallet/spend", requireAuth, async (req, res) => {
         [playerId]
       );
 
+      const before = await getCoinsNow(playerId);
       const r = await decrementCoinsIfEnough(client, playerId, spend);
       if (!r.ok) {
         await client.query("ROLLBACK"); client.release();
-        return res.status(400).json({ ok: false, error: "insufficient_balance", current: r.before });
+        console.log(`[wallet_spend] player=${playerId} before=${before} need=${spend} => INSUFFICIENT`);
+        return res.status(400).json({ ok: false, error: "insufficient_balance", current: before });
       }
 
       // coin_ledger opsiyonel (yoksa hata verme)
       try {
         await client.query(
           `INSERT INTO coin_ledger (player_id, delta, reason) VALUES ($1, $2, $3)`,
-          [playerId, -spend, reason || "theme_purchase"]
+          [playerId, -spend, (reason || "theme_purchase").toString().slice(0, 64)]
         );
       } catch {}
 
       await client.query("COMMIT");
       client.release();
 
+      console.log(`[wallet_spend] player=${playerId} before=${before} -${spend} => after=${r.after}`);
       return res.json({ ok: true, newCoins: r.after });
     } catch (e) {
       try { await client.query("ROLLBACK"); client.release(); } catch {}
       throw e;
     }
   } catch (err) {
-    console.error("wallet_spend_failed:", {
-      code: err.code, detail: err.detail, message: err.message,
-      table: err.table, constraint: err.constraint,
-    });
+    console.error("wallet_spend_failed:", err);
     return res.status(500).json({ error: "server_error" });
   }
 });
