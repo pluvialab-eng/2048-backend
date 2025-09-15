@@ -508,6 +508,133 @@ app.get("/wallet/balance", requireAuth, async (req, res) => {
   }
 });
 
+/* ------------------- THEMES (server-otoriter) ------------------- */
+
+// Sunucu tarafı fiyatlar (client ile uyumlu olsun)
+const THEME_PRICES = {
+  "Dark": 500,
+  "Pastel": 800,
+};
+
+// JSONB'de data.themes.<name> = true yap
+async function setThemeUnlocked(client, playerId, themeName) {
+  const q = `
+    UPDATE profiles
+       SET data = jsonb_set(
+                    COALESCE(data, '{}'::jsonb),
+                    $2::text[],
+                    'true'::jsonb,
+                    true
+                  ),
+           updated_at = now()
+     WHERE player_id = $1::int
+     RETURNING data->'themes' as themes;
+  `;
+  // path: {themes,Dark} gibi
+  const path = ['themes', themeName];
+  const { rows } = await client.query(q, [playerId, path]);
+  return rows?.[0]?.themes ?? null;
+}
+
+// data.themes.<name> unlocked mı?
+async function isThemeUnlocked(playerId, themeName) {
+  const r = await pool.query(
+    `SELECT (data->'themes'->>$2) = 'true' AS unlocked
+       FROM profiles
+      WHERE player_id = $1::int`,
+    [playerId, themeName]
+  );
+  return !!r.rows?.[0]?.unlocked;
+}
+
+/** GET /themes/status → { themes: {Dark: true/false, Pastel: true/false}, coins } */
+app.get("/themes/status", requireAuth, async (req, res) => {
+  try {
+    const { playerId } = req.player;
+    await ensureProfileRow(playerId);
+
+    const r = await pool.query(
+      `SELECT 
+         COALESCE(jsonb_object(array['Dark','Pastel'])
+           || jsonb_build_object('Dark', (data->'themes'->>'Dark')='true')
+           || jsonb_build_object('Pastel', (data->'themes'->>'Pastel')='true')
+         , '{}'::jsonb) AS themes,
+         COALESCE(NULLIF(data->>'coins','')::INT, 0) AS coins
+       FROM profiles
+      WHERE player_id = $1::int`,
+      [playerId]
+    );
+
+    const themes = r.rows?.[0]?.themes ?? {};
+    const coins  = r.rows?.[0]?.coins ?? 0;
+    return res.json({ themes, coins });
+  } catch (e) {
+    console.error("themes_status_failed:", e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+/** POST /themes/purchase { name: "Dark" | "Pastel" } 
+ *  Atomik: yeterli bakiye varsa COIN DÜŞ + UNLOCK
+ *  Yanıt: { ok, newCoins, themes }
+ */
+app.post("/themes/purchase", requireAuth, async (req, res) => {
+  try {
+    const { playerId } = req.player;
+    const themeName = (req.body?.name || "").toString();
+
+    if (!(themeName in THEME_PRICES)) {
+      return res.status(400).json({ error: "unknown_theme" });
+    }
+    const price = THEME_PRICES[themeName];
+
+    // Profil yoksa oluştur
+    await ensureProfileRow(playerId);
+
+    // Zaten açıksa coin düşme
+    if (await isThemeUnlocked(playerId, themeName)) {
+      const coinsNow = await getCoinsNow(playerId);
+      return res.json({ ok: true, already: true, newCoins: coinsNow, themes: { [themeName]: true } });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Yeterli bakiye var mı? — yetersizse UPDATE yapılmıyor
+      const r = await decrementCoinsIfEnough(client, playerId, price);
+      if (!r.ok) {
+        await client.query("ROLLBACK"); client.release();
+        console.log(`[themes] player=${playerId} want=${themeName} price=${price} before=${r.before} => INSUFFICIENT`);
+        return res.status(400).json({ ok: false, error: "insufficient_balance", current: r.before });
+      }
+
+      // Unlocked = true
+      const themes = await setThemeUnlocked(client, playerId, themeName);
+
+      // (opsiyonel) ledger kaydı
+      try {
+        await client.query(
+          `INSERT INTO coin_ledger (player_id, delta, reason) VALUES ($1, $2, $3)`,
+          [playerId, -price, `theme_${themeName}`.slice(0, 64)]
+        );
+      } catch {}
+
+      await client.query("COMMIT");
+      client.release();
+
+      console.log(`[themes] player=${playerId} bought=${themeName} price=${price} => newCoins=${r.after}`);
+      return res.json({ ok: true, newCoins: r.after, themes: themes || { [themeName]: true } });
+    } catch (e) {
+      try { await client.query("ROLLBACK"); client.release(); } catch {}
+      throw e;
+    }
+  } catch (err) {
+    console.error("themes_purchase_failed:", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
 // Tema vb. için COIN DÜŞ
 app.post("/wallet/spend", requireAuth, async (req, res) => {
   try {
