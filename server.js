@@ -22,7 +22,7 @@ const {
 
   GOOGLE_CLIENT_ID = "",
   GOOGLE_CLIENT_SECRET = "",
-  GOOGLE_REDIRECT_URI = "",
+  GOOGLE_REDIRECT_URI = "", // kullanılmıyor (Android için postmessage)
 
   // IAP doğrulama için
   GOOGLE_PLAY_PACKAGE = "",          // ör: com.example.a2048
@@ -96,8 +96,7 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 const oauthClient = new OAuth2Client({
   clientId:     GOOGLE_CLIENT_ID || undefined,
   clientSecret: GOOGLE_CLIENT_SECRET || undefined,
-  // Android/PGA için her zaman postmessage kullan
-  redirectUri:  "", // GOOGLE_REDIRECT_URI kullanılmıyor
+  redirectUri:  "", // Android için postmessage
 });
 
 app.post("/auth/google", async (req, res) => {
@@ -112,7 +111,7 @@ app.post("/auth/google", async (req, res) => {
       return res.status(400).json({ error: "invalid_auth_code" });
     }
 
-    // >>> postmessage sabit <<<
+    // postmessage sabit
     const { tokens } = await oauthClient.getToken({ code, redirect_uri: "" });
 
     const idToken = tokens.id_token;
@@ -128,19 +127,12 @@ app.post("/auth/google", async (req, res) => {
 
     const payload = ticket.getPayload();
     const sub = payload?.sub;
-    if (!sub) {
-      return res.status(400).json({ error: "invalid_id_token" });
-    }
+    if (!sub) return res.status(400).json({ error: "invalid_id_token" });
 
     const playerId = makePlayerIdFromSub(sub);
-
-    // >>> JWT ÜRETİMİ — dokunmuyoruz <<<
     const appJwt = jwt.sign({ playerId }, JWT_SECRET, { expiresIn: "30d" });
 
-    return res.json({
-      token: appJwt,
-      player: { playerId, googleSub: sub },
-    });
+    return res.json({ token: appJwt, player: { playerId, googleSub: sub } });
   } catch (err) {
     console.error("auth/google failed:", err?.response?.data || err?.message || err);
     const status = err?.response?.status || 500;
@@ -150,10 +142,8 @@ app.post("/auth/google", async (req, res) => {
 
 /* ------------------- SYNC ------------------- */
 
-// === sanitize + deep-merge yardımcıları ===
-function isPlainObject(v) {
-  return v && typeof v === "object" && !Array.isArray(v);
-}
+// sanitize + deep-merge yardımcıları
+function isPlainObject(v) { return v && typeof v === "object" && !Array.isArray(v); }
 function stripEmpty(obj) {
   if (!isPlainObject(obj)) return obj;
   const out = {};
@@ -164,9 +154,7 @@ function stripEmpty(obj) {
       const nested = stripEmpty(v);
       if (Object.keys(nested).length === 0) continue;
       out[k] = nested;
-    } else {
-      out[k] = v;
-    }
+    } else out[k] = v;
   }
   return out;
 }
@@ -175,15 +163,12 @@ function deepMergeKeepExisting(base, incoming) {
   const out = { ...(base || {}) };
   for (const [k, v] of Object.entries(incoming)) {
     if (v === null || v === undefined) continue;
-    if (isPlainObject(v) && isPlainObject(out[k])) {
-      out[k] = deepMergeKeepExisting(out[k], v);
-    } else {
-      out[k] = v;
-    }
+    if (isPlainObject(v) && isPlainObject(out[k])) out[k] = deepMergeKeepExisting(out[k], v);
+    else out[k] = v;
   }
   return out;
 }
-// Sunucu otoriter alanlar: client’tan gelen payload’dan atılacak
+// Sunucu otoriter alanlar (client’tan gelen payload’dan atılacak)
 const SERVER_AUTH_KEYS = new Set(["coins"]);
 
 app.get("/sync/snapshot", requireAuth, async (req, res) => {
@@ -229,9 +214,7 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
     // 1) sanitize
     data = stripEmpty(data);
     // 2) otoriter alanları düşür (ör. coins)
-    for (const k of SERVER_AUTH_KEYS) {
-      if (k in data) delete data[k];
-    }
+    for (const k of SERVER_AUTH_KEYS) { if (k in data) delete data[k]; }
 
     // 3) hâlâ boşsa: yazma; mevcut profili dön (yoksa boş satır oluştur)
     if (!data || Object.keys(data).length === 0) {
@@ -250,10 +233,7 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
     }
 
     // 4) select + deep-merge + update (idempotent)
-    const cur = await pool.query(
-      "SELECT data FROM profiles WHERE player_id=$1::int",
-      [playerId]
-    );
+    const cur = await pool.query("SELECT data FROM profiles WHERE player_id=$1::int", [playerId]);
 
     if (cur.rows.length === 0) {
       const r = await pool.query(
@@ -298,14 +278,10 @@ app.get("/debug/profile", requireAuth, async (req, res) => {
 
 // SA JSON'u (düz JSON ya da base64) -> credentials objesi
 function loadServiceAccountCredentials() {
-  if (!GOOGLE_SERVICE_ACCOUNT_JSON) {
-    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing");
-  }
+  if (!GOOGLE_SERVICE_ACCOUNT_JSON) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing");
   let jsonStr = GOOGLE_SERVICE_ACCOUNT_JSON;
   try {
-    if (!jsonStr.trim().startsWith("{")) {
-      jsonStr = Buffer.from(jsonStr, "base64").toString("utf-8");
-    }
+    if (!jsonStr.trim().startsWith("{")) jsonStr = Buffer.from(jsonStr, "base64").toString("utf-8");
   } catch {}
   return JSON.parse(jsonStr);
 }
@@ -321,7 +297,7 @@ async function getAndroidPublisher() {
   return google.androidpublisher({ version: "v3", auth: client });
 }
 
-// profiles.data->'coins' değerini güvenli arttır
+// profiles.data->'coins' güvenli arttır
 async function incrementCoins(client, playerId, delta) {
   const q = `
     UPDATE profiles
@@ -339,9 +315,8 @@ async function incrementCoins(client, playerId, delta) {
   return rows?.[0]?.coins ?? null;
 }
 
-// profiles.data->'coins' değerini güvenli azalt (yetersizse ok:false döner)
+// profiles.data->'coins' güvenli azalt (yetersizse ok:false)
 async function decrementCoinsIfEnough(client, playerId, delta) {
-  // delta pozitif gelir; biz düşeriz
   const q = `
     WITH cur AS (
       SELECT COALESCE(NULLIF(data->>'coins','')::INT, 0) AS bal
@@ -401,7 +376,7 @@ app.get("/debug/iap-token", async (_req, res) => {
   }
 });
 
-// POST /iap/verify  — IAP ile COIN EKLE
+// IAP ile COIN EKLE
 app.post("/iap/verify", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -415,18 +390,12 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
     }
 
     // Token double-spend engeli
-    const dup = await pool.query(
-      "SELECT id FROM iap_tokens WHERE token = $1",
-      [purchaseToken]
-    );
-    if (dup.rowCount > 0) {
-      return res.status(409).json({ error: "token_already_used" });
-    }
+    const dup = await pool.query("SELECT id FROM iap_tokens WHERE token = $1", [purchaseToken]);
+    if (dup.rowCount > 0) return res.status(409).json({ error: "token_already_used" });
 
     // Play doğrulaması (googleapis)
     const publisher = await getAndroidPublisher();
     let playRes, status = 200;
-
     try {
       playRes = await publisher.purchases.products.get({
         packageName: GOOGLE_PLAY_PACKAGE,
@@ -441,10 +410,7 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
     const playJson = playRes?.data || {};
     console.log("playVerify", status, JSON.stringify(playJson));
 
-    const purchased = (status === 200) &&
-                      playJson &&
-                      playJson.purchaseState === 0; // purchased
-
+    const purchased = (status === 200) && playJson && playJson.purchaseState === 0;
     if (!purchased) {
       await pool.query(
         `INSERT INTO iap_tokens (player_id, product_id, token, amount, state, raw_response)
@@ -456,9 +422,7 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
         error: "not_purchased",
         play: playJson,
         hint: {
-          service_account_email: (() => {
-            try { return loadServiceAccountCredentials().client_email; } catch { return undefined; }
-          })(),
+          service_account_email: (() => { try { return loadServiceAccountCredentials().client_email; } catch { return undefined; } })(),
           package: GOOGLE_PLAY_PACKAGE,
           productId
         }
@@ -466,9 +430,7 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
     }
 
     const amount = COIN_PRODUCTS[productId] || 0;
-    if (amount <= 0) {
-      return res.status(400).json({ error: "unknown_product" });
-    }
+    if (amount <= 0) return res.status(400).json({ error: "unknown_product" });
 
     // Tek transaction: token kaydet + coin ekle
     const client = await pool.connect();
@@ -503,7 +465,43 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
   }
 });
 
-// POST /wallet/spend  — Tema vb. için COIN DÜŞ
+/* ------------------- WALLET (server-otoriter) ------------------- */
+
+// Profil satırı yoksa oluştur
+async function ensureProfileRow(playerId) {
+  await pool.query(
+    `INSERT INTO profiles (player_id, data, updated_at)
+     VALUES ($1::int, '{}'::jsonb, now())
+     ON CONFLICT (player_id) DO NOTHING`,
+    [playerId]
+  );
+}
+
+// Anlık coin okuma
+async function getCoinsNow(playerId) {
+  const r = await pool.query(
+    `SELECT COALESCE(NULLIF(data->>'coins','')::INT, 0) AS coins
+       FROM profiles
+      WHERE player_id = $1::int`,
+    [playerId]
+  );
+  return r.rows?.[0]?.coins ?? 0;
+}
+
+/** GET /wallet/balance → { coins } */
+app.get("/wallet/balance", requireAuth, async (req, res) => {
+  try {
+    const { playerId } = req.player;
+    await ensureProfileRow(playerId);
+    const coins = await getCoinsNow(playerId);
+    return res.json({ coins });
+  } catch (e) {
+    console.error("wallet_balance_failed:", e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Tema vb. için COIN DÜŞ
 app.post("/wallet/spend", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -514,12 +512,11 @@ app.post("/wallet/spend", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "bad_amount" });
     }
 
-    // transaction: yeterli mi kontrol + düş + ledger
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
 
-      // profil satırı yoksa oluştur (coins=0)
+      // profil satırı yoksa oluştur
       await client.query(
         `INSERT INTO profiles (player_id, data, updated_at)
          VALUES ($1::int, '{}'::jsonb, now())
@@ -533,12 +530,13 @@ app.post("/wallet/spend", requireAuth, async (req, res) => {
         return res.status(400).json({ ok: false, error: "insufficient_balance", current: r.before });
       }
 
-      // coin_ledger kaydı (audit)
-      await client.query(
-        `INSERT INTO coin_ledger (player_id, delta, reason)
-         VALUES ($1::int, $2, $3)`,
-        [playerId, -spend, reason || "theme_purchase"]
-      );
+      // coin_ledger opsiyonel (yoksa hata verme)
+      try {
+        await client.query(
+          `INSERT INTO coin_ledger (player_id, delta, reason) VALUES ($1, $2, $3)`,
+          [playerId, -spend, reason || "theme_purchase"]
+        );
+      } catch {}
 
       await client.query("COMMIT");
       client.release();
