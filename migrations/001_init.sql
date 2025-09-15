@@ -2,7 +2,6 @@
 -- 001_init.sql (INT player_id mimarisi) — IDEMPOTENT
 -- =========================
 
--- players: uygulamanın ürettiği deterministik kimlik (INTEGER)
 CREATE TABLE IF NOT EXISTS players (
   id            INTEGER PRIMARY KEY,          -- makePlayerIdFromSub(sub)
   google_sub    TEXT UNIQUE,
@@ -15,7 +14,6 @@ CREATE TABLE IF NOT EXISTS players (
   last_login_at TIMESTAMPTZ
 );
 
--- Eksik kolonlar için güvenli ekleme (eski tabloları da kapsar)
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -40,7 +38,6 @@ BEGIN
   END IF;
 END$$;
 
--- game_mode enum yoksa oluştur
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'game_mode') THEN
@@ -48,7 +45,6 @@ BEGIN
   END IF;
 END$$;
 
--- mod başına tek satır (upsert edilebilir)
 CREATE TABLE IF NOT EXISTS progress (
   player_id    INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
   mode         game_mode NOT NULL,
@@ -60,7 +56,6 @@ CREATE TABLE IF NOT EXISTS progress (
   PRIMARY KEY (player_id, mode)
 );
 
--- tek tek maç geçmişi / skor koşuları
 CREATE TABLE IF NOT EXISTS runs (
   id          BIGSERIAL PRIMARY KEY,
   player_id   INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
@@ -72,16 +67,14 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- coin hareketleri (audit)
 CREATE TABLE IF NOT EXISTS coin_ledger (
   id         BIGSERIAL PRIMARY KEY,
   player_id  INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
-  delta      INT NOT NULL,     -- +/-,
+  delta      INT NOT NULL,
   reason     TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Faydalı indexler (varsa tekrar oluşturulmaz)
 CREATE INDEX IF NOT EXISTS idx_runs_player_time   ON runs(player_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_progress_updated   ON progress(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_coin_ledger_player ON coin_ledger(player_id, created_at DESC);

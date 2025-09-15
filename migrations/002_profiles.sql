@@ -2,14 +2,12 @@
 -- 002_profiles.sql — IDEMPOTENT (backfill + FK)
 -- =========================
 
--- 1) profiles tablosu yoksa oluştur
 CREATE TABLE IF NOT EXISTS profiles (
   player_id   INTEGER PRIMARY KEY,
   data        JSONB NOT NULL DEFAULT '{}'::jsonb,
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 2) Emniyet: data NOT NULL + DEFAULT '{}' (eski tablolarda yoksa)
 DO $$
 BEGIN
   IF EXISTS (
@@ -22,8 +20,7 @@ BEGIN
   END IF;
 END$$;
 
--- 3) FK eklemeden ÖNCE: profiles içindeki sahipsiz player_id'ler için players'ı backfill et
---    (coins varsa profiles.data->>'coins' üzerinden başlatılır, yoksa 0)
+-- FK öncesi backfill: sahipsiz profiles.player_id -> players.id
 INSERT INTO players (id, google_sub, pgs_player_id, display_name, country_code, coins, created_at, updated_at)
 SELECT DISTINCT
   p.player_id,
@@ -35,7 +32,6 @@ LEFT JOIN players pl ON pl.id = p.player_id
 WHERE p.player_id IS NOT NULL
   AND pl.id IS NULL;
 
--- 4) (Varsa) FK ekle: profiles.player_id -> players(id)
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -56,5 +52,4 @@ BEGIN
   END IF;
 END$$;
 
--- 5) (opsiyonel) index örneği
 -- CREATE INDEX IF NOT EXISTS idx_profiles_coins ON profiles (((data->>'coins')::INT));

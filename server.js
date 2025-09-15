@@ -22,9 +22,8 @@ const {
 
   GOOGLE_CLIENT_ID = "",
   GOOGLE_CLIENT_SECRET = "",
-  GOOGLE_REDIRECT_URI = "", // kullanılmıyor (Android için postmessage)
+  GOOGLE_REDIRECT_URI = "", // Android için postmessage
 
-  // IAP doğrulama için
   GOOGLE_PLAY_PACKAGE = "",          // ör: com.example.a2048
   GOOGLE_SERVICE_ACCOUNT_JSON = ""   // Service Account JSON (düz JSON ya da base64)
 } = process.env;
@@ -90,6 +89,36 @@ function requireAuth(req, res, next) {
   }
 }
 
+// players satırını güvenli oluştur (idempotent)
+async function ensurePlayerRow(playerId, opts = {}) {
+  const {
+    googleSub = null,
+    displayName = null,
+    countryCode = null,
+    touchLogin = false,
+  } = opts;
+
+  // minimal insert
+  await pool.query(
+    `INSERT INTO players (id) VALUES ($1::int) ON CONFLICT (id) DO NOTHING`,
+    [playerId]
+  );
+
+  // metadata / login damgası (varsa)
+  if (googleSub || displayName || countryCode || touchLogin) {
+    await pool.query(
+      `UPDATE players
+         SET google_sub = COALESCE($2, google_sub),
+             display_name = COALESCE($3, display_name),
+             country_code = COALESCE($4, country_code),
+             updated_at = now(),
+             last_login_at = CASE WHEN $5 THEN now() ELSE last_login_at END
+       WHERE id = $1::int`,
+      [playerId, googleSub, displayName, countryCode, !!touchLogin]
+    );
+  }
+}
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 /* ------------------- AUTH: /auth/google ------------------- */
@@ -132,6 +161,24 @@ app.post("/auth/google", async (req, res) => {
     const playerId = makePlayerIdFromSub(sub);
     const appJwt = jwt.sign({ playerId }, JWT_SECRET, { expiresIn: "30d" });
 
+    // players upsert + login damgası
+    const displayName = payload?.name || null;
+    const countryCode = payload?.locale || null;
+    await ensurePlayerRow(playerId, {
+      googleSub: sub,
+      displayName,
+      countryCode,
+      touchLogin: true,
+    });
+
+    // profile satırını da hazırla (FK güvenliği için)
+    await pool.query(
+      `INSERT INTO profiles (player_id, data, updated_at)
+       VALUES ($1::int, '{}'::jsonb, now())
+       ON CONFLICT (player_id) DO NOTHING`,
+      [playerId]
+    );
+
     return res.json({ token: appJwt, player: { playerId, googleSub: sub } });
   } catch (err) {
     console.error("auth/google failed:", err?.response?.data || err?.message || err);
@@ -168,35 +215,28 @@ function deepMergeKeepExisting(base, incoming) {
   }
   return out;
 }
-// Sunucu otoriter alanlar (client’tan gelen payload’dan atılacak)
+// Sunucu otoriter alanlar
 const SERVER_AUTH_KEYS = new Set(["coins"]);
 
 app.get("/sync/snapshot", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
 
-    const q = `
-      SELECT data, updated_at
-      FROM profiles
-      WHERE player_id = $1::int
-    `;
-    const { rows } = await pool.query(q, [playerId]);
+    // FK güvenliği: players/profiles garanti
+    await ensurePlayerRow(playerId);
+    await pool.query(
+      `INSERT INTO profiles (player_id, data, updated_at)
+       VALUES ($1::int, '{}'::jsonb, now())
+       ON CONFLICT (player_id) DO NOTHING`,
+      [playerId]
+    );
 
-    if (rows.length === 0) {
-      const ins = `
-        INSERT INTO profiles (player_id, data, updated_at)
-        VALUES ($1::int, '{}'::jsonb, now())
-        ON CONFLICT (player_id) DO NOTHING
-        RETURNING data, updated_at
-      `;
-      const r2 = await pool.query(ins, [playerId]);
-      if (r2.rows.length > 0) return res.json(r2.rows[0]);
+    const { rows } = await pool.query(
+      `SELECT data, updated_at FROM profiles WHERE player_id = $1::int`,
+      [playerId]
+    );
 
-      const r3 = await pool.query(q, [playerId]);
-      return res.json(r3.rows[0] ?? { data: {}, updated_at: new Date().toISOString() });
-    }
-
-    return res.json(rows[0]);
+    return res.json(rows[0] ?? { data: {}, updated_at: new Date().toISOString() });
   } catch (err) {
     console.error("snapshot_failed:", err);
     return res.status(500).json({ error: "snapshot_failed" });
@@ -208,27 +248,19 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
     const { playerId } = req.player;
     let data = (req.body && req.body.data) || {};
 
-    // 1) sanitize
+    // sanitize + authoritative fields
     data = stripEmpty(data);
-    // 2) otoriter alanları düşür (ör. coins)
     for (const k of SERVER_AUTH_KEYS) { if (k in data) delete data[k]; }
 
-    // 3) hâlâ boşsa: yazma; mevcut profili dön (yoksa boş satır oluştur)
-    if (!data || Object.keys(data).length === 0) {
-      const r0 = await pool.query(`SELECT data, updated_at FROM profiles WHERE player_id=$1::int`, [playerId]);
-      if (r0.rows.length > 0) return res.json(r0.rows[0]);
+    // FK güvenliği
+    await ensurePlayerRow(playerId);
+    await pool.query(
+      `INSERT INTO profiles (player_id, data, updated_at)
+       VALUES ($1::int, '{}'::jsonb, now())
+       ON CONFLICT (player_id) DO NOTHING`,
+      [playerId]
+    );
 
-      const r1 = await pool.query(
-        `INSERT INTO profiles (player_id, data, updated_at)
-         VALUES ($1::int, '{}'::jsonb, now())
-         ON CONFLICT (player_id) DO NOTHING
-         RETURNING data, updated_at`,
-        [playerId]
-      );
-      return res.json(r1.rows[0] ?? { data: {}, updated_at: new Date().toISOString() });
-    }
-
-    // 4) select + deep-merge + update (idempotent)
     const cur = await pool.query("SELECT data FROM profiles WHERE player_id=$1::int", [playerId]);
 
     if (cur.rows.length === 0) {
@@ -257,7 +289,7 @@ app.post("/sync/merge", requireAuth, async (req, res) => {
   }
 });
 
-// Küçük teşhis endpoint’i
+// teşhis
 app.get("/debug/profile", requireAuth, async (req, res) => {
   const { playerId } = req.player;
   const r = await pool.query(
@@ -267,9 +299,8 @@ app.get("/debug/profile", requireAuth, async (req, res) => {
   res.json({ playerId, row: r.rows[0] || null });
 });
 
-/* ------------------- IAP VERIFY (googleapis ile) ------------------- */
+/* ------------------- IAP VERIFY ------------------- */
 
-// SA JSON'u (düz JSON ya da base64) -> credentials objesi
 function loadServiceAccountCredentials() {
   if (!GOOGLE_SERVICE_ACCOUNT_JSON) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing");
   let jsonStr = GOOGLE_SERVICE_ACCOUNT_JSON;
@@ -279,7 +310,6 @@ function loadServiceAccountCredentials() {
   return JSON.parse(jsonStr);
 }
 
-// Android Publisher istemcisi
 async function getAndroidPublisher() {
   const credentials = loadServiceAccountCredentials();
   const auth = new google.auth.GoogleAuth({
@@ -290,7 +320,7 @@ async function getAndroidPublisher() {
   return google.androidpublisher({ version: "v3", auth: client });
 }
 
-// profiles.data->'coins' güvenli arttır
+// coins ++
 async function incrementCoins(client, playerId, delta) {
   const q = `
     UPDATE profiles
@@ -308,7 +338,7 @@ async function incrementCoins(client, playerId, delta) {
   return rows?.[0]?.coins ?? null;
 }
 
-// profiles.data->'coins' güvenli azalt (yetersizse UPDATE yapılmaz)
+// coins -- (yetersizse yok)
 async function decrementCoinsIfEnough(client, playerId, delta) {
   const q = `
     WITH cur AS (
@@ -343,7 +373,6 @@ async function decrementCoinsIfEnough(client, playerId, delta) {
   return { ok, before, after };
 }
 
-// Ürün → coin miktarı (client ile birebir)
 const COIN_PRODUCTS = {
   "coins_150": 150,
   "coins_300": 300,
@@ -351,7 +380,6 @@ const COIN_PRODUCTS = {
   "coins_2000": 2000,
 };
 
-// --- DEBUG: SA & paket hızlı kontrolü ---
 app.get("/debug/iap-config", (_req, res) => {
   try {
     const sa = loadServiceAccountCredentials();
@@ -366,7 +394,6 @@ app.get("/debug/iap-config", (_req, res) => {
   }
 });
 
-// --- DEBUG: Android Publisher erişimi test ---
 app.get("/debug/iap-token", async (_req, res) => {
   try {
     await getAndroidPublisher();
@@ -376,7 +403,7 @@ app.get("/debug/iap-token", async (_req, res) => {
   }
 });
 
-// IAP ile COIN EKLE
+// IAP -> coins ekle (token dedupe + Play doğrulama)
 app.post("/iap/verify", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -389,11 +416,9 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
       return res.status(500).json({ error: "server_not_configured" });
     }
 
-    // Token double-spend engeli
     const dup = await pool.query("SELECT id FROM iap_tokens WHERE token = $1", [purchaseToken]);
     if (dup.rowCount > 0) return res.status(409).json({ error: "token_already_used" });
 
-    // Play doğrulaması (googleapis)
     const publisher = await getAndroidPublisher();
     let playRes, status = 200;
     try {
@@ -432,23 +457,23 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
     const amount = COIN_PRODUCTS[productId] || 0;
     if (amount <= 0) return res.status(400).json({ error: "unknown_product" });
 
-    // Tek transaction: token kaydet + coin ekle
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
 
-      await client.query(
-        `INSERT INTO iap_tokens (player_id, product_id, token, amount, state, raw_response)
-         VALUES ($1,$2,$3,$4,'credited',$5)`,
-        [playerId, productId, purchaseToken, amount, playJson]
-      );
-
-      // profil yoksa önce oluştur (güvenlik)
+      // FK güvenliği
+      await ensurePlayerRow(playerId);
       await client.query(
         `INSERT INTO profiles (player_id, data, updated_at)
          VALUES ($1::int, '{}'::jsonb, now())
          ON CONFLICT (player_id) DO NOTHING`,
         [playerId]
+      );
+
+      await client.query(
+        `INSERT INTO iap_tokens (player_id, product_id, token, amount, state, raw_response)
+         VALUES ($1,$2,$3,$4,'credited',$5)`,
+        [playerId, productId, purchaseToken, amount, playJson]
       );
 
       const before = await getCoinsNow(playerId);
@@ -474,8 +499,8 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
 
 /* ------------------- WALLET (server-otoriter) ------------------- */
 
-// Profil satırı yoksa oluştur
 async function ensureProfileRow(playerId) {
+  await ensurePlayerRow(playerId);
   await pool.query(
     `INSERT INTO profiles (player_id, data, updated_at)
      VALUES ($1::int, '{}'::jsonb, now())
@@ -484,7 +509,6 @@ async function ensureProfileRow(playerId) {
   );
 }
 
-// Anlık coin okuma
 async function getCoinsNow(playerId) {
   const r = await pool.query(
     `SELECT COALESCE(NULLIF(data->>'coins','')::INT, 0) AS coins
@@ -495,7 +519,6 @@ async function getCoinsNow(playerId) {
   return r.rows?.[0]?.coins ?? 0;
 }
 
-/** GET /wallet/balance → { coins } */
 app.get("/wallet/balance", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -510,13 +533,11 @@ app.get("/wallet/balance", requireAuth, async (req, res) => {
 
 /* ------------------- THEMES (server-otoriter) ------------------- */
 
-// Sunucu tarafı fiyatlar (client ile uyumlu olsun)
 const THEME_PRICES = {
   "Dark": 500,
   "Pastel": 800,
 };
 
-// JSONB'de data.themes.<name> = true yap
 async function setThemeUnlocked(client, playerId, themeName) {
   const q = `
     UPDATE profiles
@@ -530,13 +551,11 @@ async function setThemeUnlocked(client, playerId, themeName) {
      WHERE player_id = $1::int
      RETURNING data->'themes' as themes;
   `;
-  // path: {themes,Dark} gibi
   const path = ['themes', themeName];
   const { rows } = await client.query(q, [playerId, path]);
   return rows?.[0]?.themes ?? null;
 }
 
-// data.themes.<name> unlocked mı?
 async function isThemeUnlocked(playerId, themeName) {
   const r = await pool.query(
     `SELECT (data->'themes'->>$2) = 'true' AS unlocked
@@ -547,7 +566,6 @@ async function isThemeUnlocked(playerId, themeName) {
   return !!r.rows?.[0]?.unlocked;
 }
 
-/** GET /themes/status → { themes: {Dark: true/false, Pastel: true/false}, coins } */
 app.get("/themes/status", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -574,10 +592,6 @@ app.get("/themes/status", requireAuth, async (req, res) => {
   }
 });
 
-/** POST /themes/purchase { name: "Dark" | "Pastel" } 
- *  Atomik: yeterli bakiye varsa COIN DÜŞ + UNLOCK
- *  Yanıt: { ok, newCoins, themes }
- */
 app.post("/themes/purchase", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -588,10 +602,8 @@ app.post("/themes/purchase", requireAuth, async (req, res) => {
     }
     const price = THEME_PRICES[themeName];
 
-    // Profil yoksa oluştur
     await ensureProfileRow(playerId);
 
-    // Zaten açıksa coin düşme
     if (await isThemeUnlocked(playerId, themeName)) {
       const coinsNow = await getCoinsNow(playerId);
       return res.json({ ok: true, already: true, newCoins: coinsNow, themes: { [themeName]: true } });
@@ -601,7 +613,6 @@ app.post("/themes/purchase", requireAuth, async (req, res) => {
     try {
       await client.query("BEGIN");
 
-      // Yeterli bakiye var mı? — yetersizse UPDATE yapılmıyor
       const r = await decrementCoinsIfEnough(client, playerId, price);
       if (!r.ok) {
         await client.query("ROLLBACK"); client.release();
@@ -609,10 +620,8 @@ app.post("/themes/purchase", requireAuth, async (req, res) => {
         return res.status(400).json({ ok: false, error: "insufficient_balance", current: r.before });
       }
 
-      // Unlocked = true
       const themes = await setThemeUnlocked(client, playerId, themeName);
 
-      // (opsiyonel) ledger kaydı
       try {
         await client.query(
           `INSERT INTO coin_ledger (player_id, delta, reason) VALUES ($1, $2, $3)`,
@@ -635,7 +644,6 @@ app.post("/themes/purchase", requireAuth, async (req, res) => {
   }
 });
 
-// Tema vb. için COIN DÜŞ
 app.post("/wallet/spend", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -650,7 +658,7 @@ app.post("/wallet/spend", requireAuth, async (req, res) => {
     try {
       await client.query("BEGIN");
 
-      // profil satırı yoksa oluştur
+      await ensurePlayerRow(playerId);
       await client.query(
         `INSERT INTO profiles (player_id, data, updated_at)
          VALUES ($1::int, '{}'::jsonb, now())
@@ -666,7 +674,6 @@ app.post("/wallet/spend", requireAuth, async (req, res) => {
         return res.status(400).json({ ok: false, error: "insufficient_balance", current: before });
       }
 
-      // coin_ledger opsiyonel (yoksa hata verme)
       try {
         await client.query(
           `INSERT INTO coin_ledger (player_id, delta, reason) VALUES ($1, $2, $3)`,
