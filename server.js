@@ -555,10 +555,10 @@ app.get("/themes/status", requireAuth, async (req, res) => {
 
     const r = await pool.query(
       `SELECT 
-         COALESCE(jsonb_object(array['Dark','Pastel'])
-           || jsonb_build_object('Dark', (data->'themes'->>'Dark')='true')
-           || jsonb_build_object('Pastel', (data->'themes'->>'Pastel')='true')
-         , '{}'::jsonb) AS themes,
+         jsonb_build_object(
+           'Dark',   (data->'themes'->>'Dark')='true',
+           'Pastel', (data->'themes'->>'Pastel')='true'
+         ) AS themes,
          COALESCE(NULLIF(data->>'coins','')::INT, 0) AS coins
        FROM profiles
       WHERE player_id = $1::int`,
