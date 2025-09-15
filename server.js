@@ -302,7 +302,6 @@ function loadServiceAccountCredentials() {
     throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing");
   }
   let jsonStr = GOOGLE_SERVICE_ACCOUNT_JSON;
-  // Base64 ise decode et
   try {
     if (!jsonStr.trim().startsWith("{")) {
       jsonStr = Buffer.from(jsonStr, "base64").toString("utf-8");
@@ -340,6 +339,35 @@ async function incrementCoins(client, playerId, delta) {
   return rows?.[0]?.coins ?? null;
 }
 
+// profiles.data->'coins' değerini güvenli azalt (yetersizse ok:false döner)
+async function decrementCoinsIfEnough(client, playerId, delta) {
+  // delta pozitif gelir; biz düşeriz
+  const q = `
+    WITH cur AS (
+      SELECT COALESCE(NULLIF(data->>'coins','')::INT, 0) AS bal
+      FROM profiles WHERE player_id = $1::int
+      FOR UPDATE
+    ), upd AS (
+      UPDATE profiles
+         SET data = jsonb_set(
+               COALESCE(data, '{}'::jsonb),
+               '{coins}',
+               to_jsonb( GREATEST( (SELECT bal FROM cur) - $2, 0) ),
+               true
+             ),
+             updated_at = now()
+       WHERE player_id = $1::int
+     RETURNING (data->>'coins')::INT AS coins
+    )
+    SELECT (SELECT bal FROM cur) AS before, (SELECT coins FROM upd) AS after;
+  `;
+  const { rows } = await client.query(q, [playerId, delta]);
+  const before = rows?.[0]?.before ?? 0;
+  const after  = rows?.[0]?.after  ?? 0;
+  if (before < delta) return { ok: false, before, after };
+  return { ok: true, before, after };
+}
+
 // Ürün → coin miktarı (client ile birebir)
 const COIN_PRODUCTS = {
   "coins_150": 150,
@@ -373,7 +401,7 @@ app.get("/debug/iap-token", async (_req, res) => {
   }
 });
 
-// POST /iap/verify
+// POST /iap/verify  — IAP ile COIN EKLE
 app.post("/iap/verify", requireAuth, async (req, res) => {
   try {
     const { playerId } = req.player;
@@ -468,6 +496,60 @@ app.post("/iap/verify", requireAuth, async (req, res) => {
     }
   } catch (err) {
     console.error("iap_verify_failed:", {
+      code: err.code, detail: err.detail, message: err.message,
+      table: err.table, constraint: err.constraint,
+    });
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// POST /wallet/spend  — Tema vb. için COIN DÜŞ
+app.post("/wallet/spend", requireAuth, async (req, res) => {
+  try {
+    const { playerId } = req.player;
+    const { amount, reason } = req.body || {};
+    const spend = parseInt(amount, 10);
+
+    if (!Number.isFinite(spend) || spend <= 0) {
+      return res.status(400).json({ error: "bad_amount" });
+    }
+
+    // transaction: yeterli mi kontrol + düş + ledger
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // profil satırı yoksa oluştur (coins=0)
+      await client.query(
+        `INSERT INTO profiles (player_id, data, updated_at)
+         VALUES ($1::int, '{}'::jsonb, now())
+         ON CONFLICT (player_id) DO NOTHING`,
+        [playerId]
+      );
+
+      const r = await decrementCoinsIfEnough(client, playerId, spend);
+      if (!r.ok) {
+        await client.query("ROLLBACK"); client.release();
+        return res.status(400).json({ ok: false, error: "insufficient_balance", current: r.before });
+      }
+
+      // coin_ledger kaydı (audit)
+      await client.query(
+        `INSERT INTO coin_ledger (player_id, delta, reason)
+         VALUES ($1::int, $2, $3)`,
+        [playerId, -spend, reason || "theme_purchase"]
+      );
+
+      await client.query("COMMIT");
+      client.release();
+
+      return res.json({ ok: true, newCoins: r.after });
+    } catch (e) {
+      try { await client.query("ROLLBACK"); client.release(); } catch {}
+      throw e;
+    }
+  } catch (err) {
+    console.error("wallet_spend_failed:", {
       code: err.code, detail: err.detail, message: err.message,
       table: err.table, constraint: err.constraint,
     });
